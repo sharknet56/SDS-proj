@@ -10,37 +10,37 @@ El controlador Ryu pide `OFPFlowStatsRequest` cada **2 segundos** (a confirmar).
 
 ## 2. Features de entrada al detector
 
-Por cada flow activo en la ventana, el controlador construye un diccionario con los siguientes campos:
+Confirmado tras EDA de InSDN: el modelo "desplegable" usa el siguiente subconjunto, todo derivable de stats de OpenFlow sin inspección de paquetes.
 
-### Crudas (directas de OpenFlow)
+### Por flow (un diccionario por flow activo en la ventana)
 
-| Campo            | Tipo  | Origen                       |
-|------------------|-------|------------------------------|
-| `src_ip`         | str   | Match field                  |
-| `dst_ip`         | str   | Match field                  |
-| `src_port`       | int   | Match field                  |
-| `dst_port`       | int   | Match field                  |
-| `protocol`       | int   | Match field (6=TCP, 17=UDP)  |
-| `packet_count`   | int   | Stats                        |
-| `byte_count`     | int   | Stats                        |
-| `duration_sec`   | int   | Stats                        |
+| Campo            | Tipo  | Origen                                   |
+|------------------|-------|------------------------------------------|
+| `src_ip`         | str   | Match field                              |
+| `dst_ip`         | str   | Match field                              |
+| `src_port`       | int   | Match field                              |
+| `dst_port`       | int   | Match field                              |
+| `protocol`       | int   | Match field (6=TCP, 17=UDP, 1=ICMP)      |
+| `pkts_per_sec`   | float | Δpacket_count / Δt entre dos polls       |
+| `bytes_per_sec`  | float | Δbyte_count / Δt entre dos polls         |
+| `avg_pkt_size`   | float | byte_count / packet_count                |
+| `flow_age_sec`   | float | duration_sec + duration_nsec / 1e9       |
 
-### Derivadas (calculadas en el controlador entre dos polls)
-
-| Campo                | Cálculo                                              |
-|----------------------|------------------------------------------------------|
-| `pkts_per_sec`       | Δpacket_count / Δt                                   |
-| `bytes_per_sec`      | Δbyte_count / Δt                                     |
-| `avg_pkt_size`       | byte_count / packet_count                            |
-| `flow_age_sec`       | duration_sec                                         |
-
-### Agregadas a nivel de ventana (TODO confirmar con grupo B quién las calcula)
+### Agregadas en la ventana de polling (un valor por ventana)
 
 | Campo                  | Cálculo                                            |
 |------------------------|----------------------------------------------------|
 | `src_ip_entropy`       | Entropía de Shannon de IPs origen en la ventana    |
 | `dst_port_entropy`     | Entropía de Shannon de puertos destino             |
 | `new_flows_per_sec`    | Flows nuevos en la ventana / Δt                    |
+
+Estas agregadas se calculan en `src/features.py` (función `window_features`) — se pueden calcular en el detector o en la Ryu app, a acordar.
+
+### Por qué NO usamos las features de IAT y flags TCP
+
+InSDN incluye 84 features. La mayoría (IAT mean/std/min/max, conteos de flags SYN/ACK/RST, packet length distributions) **requieren inspección de paquetes** y no se pueden obtener desde stats de OpenFlow estándar. Las descartamos para que el modelo entrenado offline use exactamente lo mismo que tendrá disponible en vivo.
+
+Como referencia académica, mantendremos también un "modelo full" entrenado con las 84 features para reportar el techo de rendimiento en la memoria.
 
 ## 3. Llamada al detector
 

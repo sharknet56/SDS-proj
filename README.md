@@ -53,12 +53,21 @@ pip install -r requirements.txt
 
 ### Descargar InSDN
 
-Opción A — manual desde Kaggle, descomprimir en `data/raw/`.
-
-Opción B — vía API de Kaggle (requiere `~/.kaggle/kaggle.json`):
+Usamos `kagglehub` (versión ≥ 0.4.1). Crear un API token en https://www.kaggle.com/settings → *Create new token* y guardarlo en un `.env` en la raíz del repo (ya está en `.gitignore`):
 
 ```bash
-kaggle datasets download -d muhammadumarjavaid/insdn-dataset-2020 -p data/raw --unzip
+# .env
+KAGGLE_API_TOKEN=tu_api_token
+```
+
+Alternativamente, el formato clásico `KAGGLE_USERNAME` + `KAGGLE_KEY` también funciona.
+
+Después, desde un notebook o script:
+
+```python
+from src.data import get_insdn_path
+path = get_insdn_path()      # descarga si hace falta, cachea en ~/.cache/kagglehub/
+print(path)
 ```
 
 ## Uso
