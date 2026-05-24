@@ -1,12 +1,29 @@
-"""Pipeline de entrenamiento end-to-end.
-
-Reproduce lo que hacen los notebooks 03 y 04 pero sin gráficos, para
-poder regenerar todos los modelos en una sola llamada:
+"""Entrenamiento del detector con el dataset PROPIO (data/dataset.csv).
 
     python -m src.train
 
-Produce en `models/`: scaler.pkl, iforest.pkl, autoencoder.pt,
-xgb_classifier.pkl, label_encoder.pkl, detector_meta.pkl.
+Entrena tres modelos y compara dos enfoques de clasificación:
+
+    data/dataset.csv  (11 features + label)
+        │  limpieza de duplicados
+        ▼
+        ├─ ETAPA 1: AUTOENCODER  (no supervisado, solo tráfico Normal)
+        │     11 → 16 → 8 → 4 → 8 → 16 → 11   → error de reconstrucción
+        │     umbral = P99 del error sobre Normal       → ¿es un ataque?
+        │
+        ├─ ETAPA 2a: XGBoost MULTICLASE  {Normal, DoS, DDoS}   ← se GUARDA (producción)
+        │     responde "¿de qué tipo?"; aprovecha las features agregadas
+        │
+        └─ ETAPA 2b: XGBoost BINARIO     {Normal, Attack}      ← solo COMPARACIÓN
+              responde "¿ataque sí/no?"; fusiona DoS+DDoS en "Attack"
+
+Para cada clasificador imprime F1 macro + matriz de confusión, de modo que se
+pueda comparar el enfoque binario (objetivo declarado) con el multiclase (que
+además distingue DoS de DDoS gracias a num_distinct_src_ips / src_ip_entropy).
+
+Guarda en `models/`: scaler.pkl, autoencoder.pt, xgb_classifier.pkl (multiclase,
+producción), label_encoder.pkl, xgb_classifier_binary.pkl, label_encoder_binary.pkl,
+detector_meta.pkl.
 """
 
 from __future__ import annotations
@@ -17,33 +34,37 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 import xgboost as xgb
-from sklearn.ensemble import IsolationForest
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-from src.data import get_insdn_path
 from src.detector import Autoencoder
-from src.features import INSDN_TO_OPENFLOW, clean_insdn
 
-MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+ROOT = Path(__file__).resolve().parent.parent
+MODELS_DIR = ROOT / "models"
+DATASET = ROOT / "data" / "dataset.csv"
 RANDOM_STATE = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Normaliza las etiquetas del CSV a una forma canónica. "Normal" (con mayúscula)
+# es importante porque src/detector.py decide is_anomaly comparando con "Normal".
+LABEL_MAP = {"normal": "Normal", "dos": "DoS", "ddos": "DDoS"}
+
+DEDUP = True
+
 
 def _load_dataset() -> tuple[pd.DataFrame, pd.Series]:
-    csv = next(get_insdn_path().rglob("*.csv"))
-    df = pd.read_csv(csv, low_memory=False)
+    """Lee el CSV propio: todas las columnas son features salvo 'label'."""
+    df = pd.read_csv(DATASET)
     df.columns = df.columns.str.strip()
-    df = clean_insdn(df)
-    X = df[list(INSDN_TO_OPENFLOW.keys())].copy()
-    X["Flow Duration"] = X["Flow Duration"] / 1e6
-    X = X.rename(columns=INSDN_TO_OPENFLOW)
-    return X, df["Label"]
+    y = df["label"].map(LABEL_MAP)
+    X = df.drop(columns=["label"]).astype("float32")
+    return X, y
 
 
 def _train_autoencoder(X_train_s: np.ndarray, epochs: int = 30) -> Autoencoder:
+    """Entrena el autoencoder a reconstruir tráfico Normal (in_dim = nº de features)."""
     ae = Autoencoder(in_dim=X_train_s.shape[1]).to(DEVICE)
     opt = torch.optim.Adam(ae.parameters(), lr=1e-3)
     X = torch.tensor(X_train_s, dtype=torch.float32, device=DEVICE)
@@ -71,76 +92,100 @@ def _reconstruction_error(ae: Autoencoder, X: np.ndarray) -> np.ndarray:
         return ((ae(xt) - xt) ** 2).mean(dim=1).cpu().numpy()
 
 
+def _train_and_eval(name: str, X: pd.DataFrame, y_str: pd.Series):
+    """Entrena un XGBoost y muestra F1 macro + matriz de confusión."""
+    le = LabelEncoder().fit(y_str)
+    y = le.transform(y_str)
+    Xtr, Xte, ytr, yte = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE,
+    )
+    # Pesos por clase: compensan el desbalanceo (mucho normal/ddos, poco dos).
+    counts = np.bincount(ytr)
+    sample_weight = (len(ytr) / (len(counts) * counts))[ytr]
+
+    if len(le.classes_) == 2:
+        clf = xgb.XGBClassifier(
+            n_estimators=300, max_depth=8, learning_rate=0.1,
+            objective="binary:logistic",
+            tree_method="hist", n_jobs=-1, random_state=RANDOM_STATE,
+            eval_metric="logloss",
+        )
+    else:
+        clf = xgb.XGBClassifier(
+            n_estimators=300, max_depth=8, learning_rate=0.1,
+            objective="multi:softprob", num_class=len(le.classes_),
+            tree_method="hist", n_jobs=-1, random_state=RANDOM_STATE,
+            eval_metric="mlogloss",
+        )
+    clf.fit(Xtr, ytr, sample_weight=sample_weight)
+
+    yp = clf.predict(Xte)
+    print(f"\n=== {name} ===")
+    print(f"  F1 macro = {f1_score(yte, yp, average='macro'):.4f}")
+    print(f"  Clases: {list(le.classes_)}")
+    print("  Matriz de confusión (filas=real, columnas=predicho):")
+    print(confusion_matrix(yte, yp))
+    print(classification_report(yte, yp, target_names=le.classes_))
+    return clf, le
+
+
 def main() -> None:
     MODELS_DIR.mkdir(exist_ok=True)
     print(f"Device: {DEVICE}")
 
     X, y_str = _load_dataset()
-    feature_names = list(X.columns)
     print(f"Dataset: {X.shape}  clases={dict(y_str.value_counts())}")
 
-    # --- Detector de anomalías: solo tráfico Normal ---
+    if DEDUP:
+        before = len(X)
+        keep = ~X.duplicated(keep="first")
+        X = X[keep].reset_index(drop=True)
+        y_str = y_str[keep].reset_index(drop=True)
+        print(f"Dedup: {before} -> {len(X)} filas "
+              f"({before - len(X)} duplicados, {100 * (before - len(X)) / before:.1f}%)")
+
+    feature_names = list(X.columns)
+    print(f"Features ({len(feature_names)}): {feature_names}")
+
+    # ---------- ETAPA 1: autoencoder (solo Normal) ----------
     is_normal = (y_str == "Normal").values
-    X_norm, X_atk = X[is_normal], X[~is_normal]
-    X_train, X_val_normal = train_test_split(X_norm, test_size=0.3, random_state=RANDOM_STATE)
+    X_norm = X[is_normal]
+    X_train, X_val_normal = train_test_split(
+        X_norm, test_size=0.3, random_state=RANDOM_STATE,
+    )
 
     scaler = StandardScaler().fit(X_train)
     X_train_s = scaler.transform(X_train)
     X_val_s = scaler.transform(X_val_normal)
 
-    print("Entrenando Isolation Forest...")
-    iforest = IsolationForest(
-        n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1,
-    ).fit(X_train_s)
-
-    print("Entrenando Autoencoder...")
+    print("\nEntrenando Autoencoder...")
     ae = _train_autoencoder(X_train_s, epochs=30)
-
     ae_scores_val = _reconstruction_error(ae, X_val_s)
-    if_scores_val = -iforest.score_samples(X_val_s)
     ae_thr_p99 = float(np.percentile(ae_scores_val, 99))
-    if_thr_p99 = float(np.percentile(if_scores_val, 99))
     print(f"  AE threshold P99 = {ae_thr_p99:.5f}")
-    print(f"  IF threshold P99 = {if_thr_p99:.5f}")
 
-    # --- Clasificador: todas las clases menos U2R ---
-    print("Entrenando clasificador XGBoost...")
-    mask = y_str != "U2R"
-    Xc = X[mask].reset_index(drop=True)
-    yc_str = y_str[mask].reset_index(drop=True)
-    le = LabelEncoder().fit(yc_str)
-    yc = le.transform(yc_str)
+    # ---------- ETAPA 2a: clasificador MULTICLASE (producción) ----------
+    clf_multi, le_multi = _train_and_eval("MULTICLASE  {Normal, DoS, DDoS}", X, y_str)
 
-    Xc_tr, Xc_te, yc_tr, yc_te = train_test_split(
-        Xc, yc, test_size=0.2, stratify=yc, random_state=RANDOM_STATE,
-    )
-    counts = np.bincount(yc_tr)
-    sample_weight = (len(yc_tr) / (len(counts) * counts))[yc_tr]
+    # ---------- ETAPA 2b: clasificador BINARIO (comparación) ----------
+    y_bin = y_str.apply(lambda c: "Normal" if c == "Normal" else "Attack")
+    clf_bin, le_bin = _train_and_eval("BINARIO  {Normal, Attack}", X, y_bin)
 
-    clf = xgb.XGBClassifier(
-        n_estimators=300, max_depth=8, learning_rate=0.1,
-        objective="multi:softprob", num_class=len(le.classes_),
-        tree_method="hist", n_jobs=-1, random_state=RANDOM_STATE,
-        eval_metric="mlogloss",
-    )
-    clf.fit(Xc_tr, yc_tr, sample_weight=sample_weight)
-    from sklearn.metrics import f1_score
-    yp = clf.predict(Xc_te)
-    print(f"  XGB F1 macro = {f1_score(yc_te, yp, average='macro'):.4f}")
-
-    # --- Persistencia ---
+    # ---------- Persistencia ----------
+    # El modelo de producción es el MULTICLASE: su salida ya da el binario
+    # (is_anomaly = attack_type != 'Normal') y además el tipo de ataque.
     joblib.dump(scaler, MODELS_DIR / "scaler.pkl")
-    joblib.dump(iforest, MODELS_DIR / "iforest.pkl")
     torch.save(ae.state_dict(), MODELS_DIR / "autoencoder.pt")
-    joblib.dump(clf, MODELS_DIR / "xgb_classifier.pkl")
-    joblib.dump(le, MODELS_DIR / "label_encoder.pkl")
+    joblib.dump(clf_multi, MODELS_DIR / "xgb_classifier.pkl")
+    joblib.dump(le_multi, MODELS_DIR / "label_encoder.pkl")
+    joblib.dump(clf_bin, MODELS_DIR / "xgb_classifier_binary.pkl")
+    joblib.dump(le_bin, MODELS_DIR / "label_encoder_binary.pkl")
     joblib.dump({
         "features": feature_names,
         "ae_thr_p99": ae_thr_p99,
-        "iforest_thr_p99": if_thr_p99,
         "ae_arch": {"in_dim": X.shape[1], "hidden": [16, 8, 4]},
     }, MODELS_DIR / "detector_meta.pkl")
-    print(f"Modelos guardados en {MODELS_DIR}")
+    print(f"\nModelos guardados en {MODELS_DIR}")
 
 
 if __name__ == "__main__":
