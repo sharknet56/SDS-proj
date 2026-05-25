@@ -40,6 +40,15 @@ DETECTOR_ADDR = ("127.0.0.1", 9999)
 # --- parámetros de mitigación ---
 MIT_PERSISTENCE = 3      # sondeos seguidos con ataque antes de actuar
 MIT_MIN_CONF = 0.80      # confianza mínima del modelo para actuar
+MIT_COOKIE = 0xCAFE      # cookie mágico para las reglas drop priority=100; nos
+                         # permite borrar flujos del atacante (cookie=0) con
+                         # OFPFC_DELETE sin cargarnos la propia regla de drop
+# Filtros anti-falsos-positivos por tipo de ataque. El modelo a veces marca
+# como ataque tráfico legítimo de muy poco volumen (ping aislado, ARP residual).
+# Sin estos filtros se acaba bloqueando hosts sanos.
+MIT_DOS_MIN_PPS = 50          # un DoS real va a >>50 pps; un ping va a 1-2 pps
+MIT_DDOS_MIN_NEW_FLOWS = 5    # nuevos flujos/seg típicos de DDoS spoofed
+MIT_DDOS_MIN_DISTINCT_SRCS = 10  # IPs origen distintas en la ventana
 MIT_TIMEOUT = 1200         # segundos que dura la regla (luego expira sola)
 
 
@@ -55,7 +64,8 @@ class DetectApp(app_manager.RyuApp):
         self.attack_streak = 0      # sondeos consecutivos con ataque
         self.mitigated = {}         # objetivo -> instante de expiración
         self.ip_to_mac = {}         # ip_src -> eth_src aprendido en packet_in
-        self.mac_to_ips = {}        # eth_src -> set(ip_src) (para limpiar flujos al bloquear)
+        self.blocked_macs = {}      # eth_src -> instante de expiración
+        self.blocked_ips = {}       # ipv4_src -> instante de expiración
         self.monitor_thread = hub.spawn(self._monitor)
         self.logger.info("[detect] detector en %s:%d | mitigacion: persist=%d conf>=%.2f timeout=%ds",
                          DETECTOR_ADDR[0], DETECTOR_ADDR[1],
@@ -91,19 +101,34 @@ class DetectApp(app_manager.RyuApp):
         eth = pkt.get_protocols(ethernet.ethernet)[0]
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
+
+        # Cortocircuito para tráfico ya mitigado: aunque el priority=100 en el
+        # switch ya esté tirando los paquetes nuevos, la cola de packet-ins
+        # que se acumuló ANTES del bloqueo sigue drenando. Si no salimos
+        # aquí, cada packet-in del backlog reinstala un priority=1 nuevo y
+        # la tabla nunca se vacía.
+        now = time.time()
+        if self.blocked_macs.get(eth.src, 0) > now:
+            return
+        ip = pkt.get_protocol(ipv4.ipv4)
+        if ip and self.blocked_ips.get(ip.src, 0) > now:
+            return
+
         self.mac_to_port.setdefault(dp.id, {})
         self.mac_to_port[dp.id][eth.src] = in_port
         out_port = self.mac_to_port[dp.id].get(eth.dst, ofp.OFPP_FLOOD)
         actions = [p.OFPActionOutput(out_port)]
-        ip = pkt.get_protocol(ipv4.ipv4)
         if ip:
             # Aprende ip_src -> eth_src. Con --rand-source habrá muchas IPs
             # falsas apuntando todas a la misma MAC real del atacante; eso es
             # justo lo que queremos para bloquear por MAC ante un DDoS.
             self.ip_to_mac[ip.src] = eth.src
-            self.mac_to_ips.setdefault(eth.src, set()).add(ip.src)
         if ip and out_port != ofp.OFPP_FLOOD:
-            kwargs = dict(eth_type=ether_types.ETH_TYPE_IP,
+            # Incluir eth_src en el match permite borrar de una sola vez los
+            # flujos de un atacante con OFPFC_DELETE(match(eth_src=MAC)) sin
+            # depender de listas de IPs spoofeadas.
+            kwargs = dict(eth_src=eth.src,
+                          eth_type=ether_types.ETH_TYPE_IP,
                           ipv4_src=ip.src, ipv4_dst=ip.dst, ip_proto=ip.proto)
             t = pkt.get_protocol(tcp.tcp)
             u = pkt.get_protocol(udp.udp)
@@ -154,20 +179,38 @@ class DetectApp(app_manager.RyuApp):
             self.logger.warning("[ALERTA] %d/%d flujos de ataque (racha=%d)",
                                  attacks, total, self.attack_streak)
         if self.attack_streak >= MIT_PERSISTENCE:
-            self._mitigate(zip(stats, results))
+            self._mitigate(zip(stats, feats_list, results))
 
     # ---------- mitigación ----------
-    def _mitigate(self, pairs):
+    def _mitigate(self, triples):
         # Las reglas se instalan en TODOS los switches conocidos, no solo en
         # el que ha disparado la detección. Con tree,depth=2,fanout=2 el
         # tráfico pasa por varios switches y bloquear en uno solo deja la
         # red corriendo en los demás.
         now = time.time()
-        for stat, v in pairs:
+        for stat, feats, v in triples:
             if not v.get("is_anomaly") or v.get("confidence", 0) < MIT_MIN_CONF:
                 continue
             m = stat.match
             atype = v.get("attack_type")
+            # Filtros anti-FP por tipo de ataque:
+            #  - DoS: una sola fuente -> el propio flujo tiene mucho volumen.
+            #  - DDoS: muchas fuentes spoofeadas -> cada flujo individual va
+            #    a poco volumen, pero la ventana tiene alta diversidad.
+            pps = feats.get("packets_per_sec", 0)
+            n_src = feats.get("num_distinct_src_ips", 0)
+            new_fps = feats.get("new_flows_per_sec", 0)
+            if atype == "DoS" and pps < MIT_DOS_MIN_PPS:
+                self.logger.warning("[MITIGACION] descartado FP DoS: pps=%.1f < %d (ipv4_src=%s)",
+                                    pps, MIT_DOS_MIN_PPS,
+                                    lf.mget(m, "ipv4_src", "?"))
+                continue
+            if atype == "DDoS" and (n_src < MIT_DDOS_MIN_DISTINCT_SRCS
+                                    and new_fps < MIT_DDOS_MIN_NEW_FLOWS):
+                self.logger.warning("[MITIGACION] descartado FP DDoS: n_src=%d new_fps=%.1f (ipv4_src=%s)",
+                                    n_src, new_fps,
+                                    lf.mget(m, "ipv4_src", "?"))
+                continue
             if atype == "DoS":
                 ip_src = lf.mget(m, "ipv4_src", None)
                 if not ip_src:
@@ -200,41 +243,49 @@ class DetectApp(app_manager.RyuApp):
         n = 0
         for dp in self.datapaths.values():
             p = dp.ofproto_parser
+            ofp = dp.ofproto
             match = p.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=ip_src)
-            # instrucciones vacías = drop
+            # ADD drop priority=100 con cookie=MIT_COOKIE (instrucciones=[] = drop).
             dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
+                                     cookie=MIT_COOKIE,
                                      hard_timeout=MIT_TIMEOUT, instructions=[]))
+            # Borra priority=1 del atacante (cookie=0). cookie_mask asegura
+            # que NO se borre nuestra propia regla de drop (cookie=MIT_COOKIE).
+            dp.send_msg(p.OFPFlowMod(datapath=dp,
+                                     command=ofp.OFPFC_DELETE,
+                                     cookie=0, cookie_mask=0xFFFFFFFFFFFFFFFF,
+                                     out_port=ofp.OFPP_ANY,
+                                     out_group=ofp.OFPG_ANY,
+                                     match=match))
             n += 1
+        self.blocked_ips[ip_src] = time.time() + MIT_TIMEOUT
         self.logger.warning("[MITIGACION] DoS -> drop ipv4_src=%s en %d switch(es) durante %ds",
                             ip_src, n, MIT_TIMEOUT)
 
     def _block_mac(self, mac_src):
-        # 1) Instala el drop priority=100 con match(eth_src) en todos los
-        #    switches: resistente a IP spoofing, corta el tráfico en origen.
-        # 2) Limpia los priority=1 que esa MAC dejó instalados con IPs
-        #    falsas. Si no, durante 30s ocupan tabla y bloquean otros
-        #    pings (la tabla de OVS llega a saturarse rápido).
+        # 1) ADD drop priority=100 con match(eth_src), cookie=MIT_COOKIE.
+        # 2) DELETE de los priority=1 del atacante (cookie=0). El cookie_mask
+        #    impide que se borre la regla de drop que acabamos de añadir
+        #    (un fallo encontrado: OF DELETE compara solo match, sin priority).
         n_blocks = 0
-        n_cleaned = 0
-        spoofed_ips = list(self.mac_to_ips.get(mac_src, ()))
         for dp in self.datapaths.values():
             p = dp.ofproto_parser
             ofp = dp.ofproto
             match = p.OFPMatch(eth_src=mac_src)
             dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
+                                     cookie=MIT_COOKIE,
                                      hard_timeout=MIT_TIMEOUT, instructions=[]))
+            dp.send_msg(p.OFPFlowMod(datapath=dp,
+                                     command=ofp.OFPFC_DELETE,
+                                     cookie=0, cookie_mask=0xFFFFFFFFFFFFFFFF,
+                                     out_port=ofp.OFPP_ANY,
+                                     out_group=ofp.OFPG_ANY,
+                                     match=match))
             n_blocks += 1
-            for ip in spoofed_ips:
-                del_match = p.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=ip)
-                dp.send_msg(p.OFPFlowMod(datapath=dp,
-                                         command=ofp.OFPFC_DELETE,
-                                         out_port=ofp.OFPP_ANY,
-                                         out_group=ofp.OFPG_ANY,
-                                         match=del_match))
-                n_cleaned += 1
-        self.logger.warning("[MITIGACION] DDoS -> drop eth_src=%s en %d switch(es) | "
-                            "borrados %d flujos priority=1 (%d IPs falsas) durante %ds",
-                            mac_src, n_blocks, n_cleaned, len(spoofed_ips), MIT_TIMEOUT)
+        self.blocked_macs[mac_src] = time.time() + MIT_TIMEOUT
+        self.logger.warning("[MITIGACION] DDoS -> drop eth_src=%s en %d switch(es) "
+                            "+ limpia priority=1 propios | durante %ds",
+                            mac_src, n_blocks, MIT_TIMEOUT)
 
     def _ask_detector(self, feats_list):
         results = []
