@@ -61,10 +61,13 @@ class CaptureApp(app_manager.RyuApp):
         dp = ev.msg.datapath
         self.datapaths[dp.id] = dp
         p = dp.ofproto_parser
-        # regla por defecto: lo no reconocido va al controlador
+        # Regla por defecto: lo no reconocido va al controlador. Permanente
+        # (idle=0); si expira, el switch se queda sin camino al controlador y
+        # no vuelven a instalarse flujos.
         self._add_flow(dp, 0, p.OFPMatch(),
                        [p.OFPActionOutput(dp.ofproto.OFPP_CONTROLLER,
-                                          dp.ofproto.OFPCML_NO_BUFFER)])
+                                          dp.ofproto.OFPCML_NO_BUFFER)],
+                       idle=0)
 
     def _add_flow(self, dp, prio, match, actions, idle=30):
         p = dp.ofproto_parser

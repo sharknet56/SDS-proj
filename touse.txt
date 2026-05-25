@@ -1,0 +1,15 @@
+
+Terminal 1:
+
+source .venv/bin/activate
+python serve_detector.py
+
+Terminal 2:
+
+source .venv/bin/activate
+ryu-manager detect_app.py
+
+Terminal 3:
+
+source .venv/bin/activate
+sudo mn --topo tree,depth=2,fanout=2 --switch ovsk,protocols=OpenFlow13 --controller=remote,ip=127.0.0.1,port=6633

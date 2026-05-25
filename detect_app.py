@@ -5,8 +5,10 @@ detector por socket y, si confirma un ataque de forma sostenida, aplica una
 mitigación según el tipo:
 
     DoS  -> bloquear la IP origen (fuente real y única)
-    DDoS -> rate-limit del tráfico hacia la víctima:puerto (origen no fiable;
-            se protege el servicio atacado sin tocar el resto del host)
+    DDoS -> bloquear la MAC origen del atacante. Aunque el atacante use
+            --rand-source para spoofear IPs, la MAC L2 sigue siendo la del
+            host real, así que cortamos el tráfico en origen. Para mapear
+            ip_src -> eth_src aprendemos en packet_in (ver self.ip_to_mac).
 
 Salvaguardas contra falsos positivos:
   - PERSISTENCIA: solo actúa tras varios sondeos seguidos con ataque.
@@ -38,11 +40,7 @@ DETECTOR_ADDR = ("127.0.0.1", 9999)
 # --- parámetros de mitigación ---
 MIT_PERSISTENCE = 3      # sondeos seguidos con ataque antes de actuar
 MIT_MIN_CONF = 0.80      # confianza mínima del modelo para actuar
-MIT_TIMEOUT = 30         # segundos que dura la regla (luego expira sola)
-DDOS_RATE_KBPS = 1000    # tasa a la que se limita la víctima:puerto en un DDoS
-# Si los meters de tu OVS fallan (soporte quisquilloso), pon False: en vez de
-# limitar, bloqueará temporalmente la víctima:puerto (más brusco pero fiable).
-USE_METER = True
+MIT_TIMEOUT = 1200         # segundos que dura la regla (luego expira sola)
 
 
 class DetectApp(app_manager.RyuApp):
@@ -56,7 +54,8 @@ class DetectApp(app_manager.RyuApp):
         self.prev_keys = set()
         self.attack_streak = 0      # sondeos consecutivos con ataque
         self.mitigated = {}         # objetivo -> instante de expiración
-        self.next_meter_id = 1
+        self.ip_to_mac = {}         # ip_src -> eth_src aprendido en packet_in
+        self.mac_to_ips = {}        # eth_src -> set(ip_src) (para limpiar flujos al bloquear)
         self.monitor_thread = hub.spawn(self._monitor)
         self.logger.info("[detect] detector en %s:%d | mitigacion: persist=%d conf>=%.2f timeout=%ds",
                          DETECTOR_ADDR[0], DETECTOR_ADDR[1],
@@ -68,9 +67,12 @@ class DetectApp(app_manager.RyuApp):
         dp = ev.msg.datapath
         self.datapaths[dp.id] = dp
         p = dp.ofproto_parser
+        # Table-miss permanente (idle=0). Si expira, nada llega al controlador
+        # y el switch se queda sordo: ni se instalan flujos nuevos ni hay ping.
         self._add_flow(dp, 0, p.OFPMatch(),
                        [p.OFPActionOutput(dp.ofproto.OFPP_CONTROLLER,
-                                          dp.ofproto.OFPCML_NO_BUFFER)])
+                                          dp.ofproto.OFPCML_NO_BUFFER)],
+                       idle=0)
 
     def _add_flow(self, dp, prio, match, actions, idle=30):
         p = dp.ofproto_parser
@@ -94,6 +96,12 @@ class DetectApp(app_manager.RyuApp):
         out_port = self.mac_to_port[dp.id].get(eth.dst, ofp.OFPP_FLOOD)
         actions = [p.OFPActionOutput(out_port)]
         ip = pkt.get_protocol(ipv4.ipv4)
+        if ip:
+            # Aprende ip_src -> eth_src. Con --rand-source habrá muchas IPs
+            # falsas apuntando todas a la misma MAC real del atacante; eso es
+            # justo lo que queremos para bloquear por MAC ante un DDoS.
+            self.ip_to_mac[ip.src] = eth.src
+            self.mac_to_ips.setdefault(eth.src, set()).add(ip.src)
         if ip and out_port != ofp.OFPP_FLOOD:
             kwargs = dict(eth_type=ether_types.ETH_TYPE_IP,
                           ipv4_src=ip.src, ipv4_dst=ip.dst, ip_proto=ip.proto)
@@ -146,10 +154,14 @@ class DetectApp(app_manager.RyuApp):
             self.logger.warning("[ALERTA] %d/%d flujos de ataque (racha=%d)",
                                  attacks, total, self.attack_streak)
         if self.attack_streak >= MIT_PERSISTENCE:
-            self._mitigate(ev.msg.datapath, zip(stats, results))
+            self._mitigate(zip(stats, results))
 
     # ---------- mitigación ----------
-    def _mitigate(self, dp, pairs):
+    def _mitigate(self, pairs):
+        # Las reglas se instalan en TODOS los switches conocidos, no solo en
+        # el que ha disparado la detección. Con tree,depth=2,fanout=2 el
+        # tráfico pasa por varios switches y bloquear en uno solo deja la
+        # red corriendo en los demás.
         now = time.time()
         for stat, v in pairs:
             if not v.get("is_anomaly") or v.get("confidence", 0) < MIT_MIN_CONF:
@@ -163,65 +175,66 @@ class DetectApp(app_manager.RyuApp):
                 key = ("ip", ip_src)
                 if self._recent(key, now):
                     continue
-                self._block_ip(dp, ip_src)
+                self._block_ip(ip_src)
                 self.mitigated[key] = now + MIT_TIMEOUT
             elif atype == "DDoS":
-                ip_dst = lf.mget(m, "ipv4_dst", None)
-                if not ip_dst:
+                ip_src = lf.mget(m, "ipv4_src", None)
+                if not ip_src:
                     continue
-                proto = lf.mget(m, "ip_proto", 0)
-                l4 = lf.mget(m, "tcp_dst", 0) or lf.mget(m, "udp_dst", 0) or 0
-                key = ("vp", ip_dst, l4)
+                mac_src = self.ip_to_mac.get(ip_src)
+                if not mac_src:
+                    # Sin mapeo aprendido no podemos bloquear por MAC; lo
+                    # registramos para diagnosticar y saltamos este flujo.
+                    self.logger.warning("[MITIGACION] DDoS: sin MAC para ip_src=%s", ip_src)
+                    continue
+                key = ("mac", mac_src)
                 if self._recent(key, now):
                     continue
-                self._rate_limit(dp, ip_dst, l4, proto)
+                self._block_mac(mac_src)
                 self.mitigated[key] = now + MIT_TIMEOUT
 
     def _recent(self, key, now):
         return key in self.mitigated and self.mitigated[key] > now
 
-    def _block_ip(self, dp, ip_src):
-        p = dp.ofproto_parser
-        match = p.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=ip_src)
-        # instrucciones vacías = drop
-        dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
-                                 hard_timeout=MIT_TIMEOUT, instructions=[]))
-        self.logger.warning("[MITIGACION] DoS -> bloqueo IP origen %s durante %ds",
-                            ip_src, MIT_TIMEOUT)
+    def _block_ip(self, ip_src):
+        n = 0
+        for dp in self.datapaths.values():
+            p = dp.ofproto_parser
+            match = p.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=ip_src)
+            # instrucciones vacías = drop
+            dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
+                                     hard_timeout=MIT_TIMEOUT, instructions=[]))
+            n += 1
+        self.logger.warning("[MITIGACION] DoS -> drop ipv4_src=%s en %d switch(es) durante %ds",
+                            ip_src, n, MIT_TIMEOUT)
 
-    def _rate_limit(self, dp, ip_dst, l4_dst, ip_proto):
-        p = dp.ofproto_parser
-        ofp = dp.ofproto
-        kwargs = dict(eth_type=ether_types.ETH_TYPE_IP, ipv4_dst=ip_dst, ip_proto=ip_proto)
-        if ip_proto == 6 and l4_dst:
-            kwargs["tcp_dst"] = l4_dst
-        elif ip_proto == 17 and l4_dst:
-            kwargs["udp_dst"] = l4_dst
-        match = p.OFPMatch(**kwargs)
-
-        if USE_METER:
-            try:
-                mid = self.next_meter_id
-                self.next_meter_id += 1
-                band = p.OFPMeterBandDrop(rate=DDOS_RATE_KBPS, burst_size=DDOS_RATE_KBPS)
-                dp.send_msg(p.OFPMeterMod(dp, command=ofp.OFPMC_ADD,
-                                          flags=ofp.OFPMF_KBPS, meter_id=mid, bands=[band]))
-                inst = [p.OFPInstructionMeter(mid),
-                        p.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
-                                                [p.OFPActionOutput(ofp.OFPP_NORMAL)])]
-                dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
-                                         hard_timeout=MIT_TIMEOUT, instructions=inst))
-                self.logger.warning("[MITIGACION] DDoS -> rate-limit %s:%s a %d kbps durante %ds",
-                                    ip_dst, l4_dst, DDOS_RATE_KBPS, MIT_TIMEOUT)
-                return
-            except Exception as e:
-                self.logger.error("[MITIGACION] meter no disponible (%s); bloqueo temporal", e)
-
-        # Fallback: bloquear la víctima:puerto (instrucciones vacías = drop).
-        dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
-                                 hard_timeout=MIT_TIMEOUT, instructions=[]))
-        self.logger.warning("[MITIGACION] DDoS -> bloqueo %s:%s durante %ds (sin meter)",
-                            ip_dst, l4_dst, MIT_TIMEOUT)
+    def _block_mac(self, mac_src):
+        # 1) Instala el drop priority=100 con match(eth_src) en todos los
+        #    switches: resistente a IP spoofing, corta el tráfico en origen.
+        # 2) Limpia los priority=1 que esa MAC dejó instalados con IPs
+        #    falsas. Si no, durante 30s ocupan tabla y bloquean otros
+        #    pings (la tabla de OVS llega a saturarse rápido).
+        n_blocks = 0
+        n_cleaned = 0
+        spoofed_ips = list(self.mac_to_ips.get(mac_src, ()))
+        for dp in self.datapaths.values():
+            p = dp.ofproto_parser
+            ofp = dp.ofproto
+            match = p.OFPMatch(eth_src=mac_src)
+            dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
+                                     hard_timeout=MIT_TIMEOUT, instructions=[]))
+            n_blocks += 1
+            for ip in spoofed_ips:
+                del_match = p.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=ip)
+                dp.send_msg(p.OFPFlowMod(datapath=dp,
+                                         command=ofp.OFPFC_DELETE,
+                                         out_port=ofp.OFPP_ANY,
+                                         out_group=ofp.OFPG_ANY,
+                                         match=del_match))
+                n_cleaned += 1
+        self.logger.warning("[MITIGACION] DDoS -> drop eth_src=%s en %d switch(es) | "
+                            "borrados %d flujos priority=1 (%d IPs falsas) durante %ds",
+                            mac_src, n_blocks, n_cleaned, len(spoofed_ips), MIT_TIMEOUT)
 
     def _ask_detector(self, feats_list):
         results = []

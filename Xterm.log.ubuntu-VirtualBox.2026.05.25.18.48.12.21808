@@ -1,0 +1,5 @@
+^C
+--- 10.0.0.4 hping statistic ---
+22050939 packets transmitted, 0 packets received, 100% packet loss
+round-trip min/avg/max = 0.0/0.0/0.0 ms
+root@ubuntu-VirtualBox:/home/ubuntu/Escritorio/try4/SDS-proj# 
