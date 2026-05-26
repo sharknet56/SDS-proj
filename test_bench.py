@@ -367,24 +367,43 @@ def _case(name):
     return wrap
 
 
-@_case("_block_ip instala OFPFlowMod con ipv4_src + drop + hard_timeout")
+@_case("_block_ip envía DELETE de forwarding + ADD del bloqueo (ambos por ipv4_src)")
 def _t1():
     """
     Escenario : detectamos un DoS desde 10.0.0.5 y llamamos a _block_ip.
     Acción    : _block_ip(dp, '10.0.0.5').
-    Esperado  : se envía UNA OFPFlowMod al switch con match.ipv4_src=10.0.0.5,
-                acción vacía (=drop), hard_timeout=MIT_TIMEOUT, prioridad 100.
-    Verifica  : la mitigación de DoS instala la regla correcta a nivel L3.
+    Esperado  : se envían DOS OFPFlowMod al switch:
+                  1) OFPFC_DELETE con match.ipv4_src=10.0.0.5 → borra las
+                     prio=1 de forwarding (sin esto persisten 30s con stats
+                     fantasma del ataque y el detector sigue clasificando DoS).
+                  2) OFPFC_ADD prio=100, match.ipv4_src=10.0.0.5, drop,
+                     hard_timeout=MIT_TIMEOUT → el bloqueo real.
+                El orden importa: DELETE antes de ADD, porque OFPFC_DELETE
+                no filtra por prioridad y borraría también el ADD si fuera al
+                revés.
+    Verifica  : la mitigación DoS instala la regla correcta a nivel L3 y deja
+                el switch sin residuos de forwarding que falseen detecciones.
     """
     app, dp = _make_app(), _make_dp()
     app._block_ip(dp, "10.0.0.5")
-    assert len(dp.sent) == 1
-    _, kw = dp.sent[0]
-    _, match_kw = kw["match"]
-    assert match_kw["ipv4_src"] == "10.0.0.5"
-    assert kw["hard_timeout"] == MIT_TIMEOUT
-    assert kw["instructions"] == []
-    assert kw["priority"] == 100
+    assert len(dp.sent) == 2
+
+    # 1) DELETE primero — pasa 'command', no pasa priority/hard_timeout/instructions.
+    _, kw_del = dp.sent[0]
+    _, match_del = kw_del["match"]
+    assert match_del["ipv4_src"] == "10.0.0.5"
+    assert "command" in kw_del
+    assert "instructions" not in kw_del
+    assert "hard_timeout" not in kw_del
+
+    # 2) ADD del bloqueo después — pasa priority/hard_timeout/instructions, no 'command'.
+    _, kw_add = dp.sent[1]
+    _, match_add = kw_add["match"]
+    assert match_add["ipv4_src"] == "10.0.0.5"
+    assert kw_add["hard_timeout"] == MIT_TIMEOUT
+    assert kw_add["instructions"] == []
+    assert kw_add["priority"] == 100
+    assert "command" not in kw_add
 
 
 @_case("_block_mac instala OFPFlowMod con eth_src + drop + hard_timeout")
@@ -448,9 +467,10 @@ def _t5():
     """
     Escenario : flujo desde 10.0.0.5 clasificado como DoS, confianza 0.95.
     Acción    : _mitigate con ese par (stat, veredicto).
-    Esperado  : llama a _block_ip internamente → envía OFPFlowMod con
-                ipv4_src=10.0.0.5, y registra ('ip','10.0.0.5') en self.mitigated
-                con su instante de expiración.
+    Esperado  : llama a _block_ip internamente → envía DOS OFPFlowMod
+                (DELETE de forwarding prio=1 + ADD del bloqueo prio=100),
+                ambos con ipv4_src=10.0.0.5, y registra ('ip','10.0.0.5')
+                en self.mitigated.
     Verifica  : el camino end-to-end DoS (decisión → regla → registro)
                 funciona y los datos pasan por las claves correctas.
     """
@@ -458,10 +478,10 @@ def _t5():
     pairs = [(_flow_stat("10.0.0.5"),
               {"is_anomaly": True, "attack_type": "DoS", "confidence": 0.95})]
     app._mitigate(dp, pairs)
-    assert len(dp.sent) == 1
-    _, kw = dp.sent[0]
-    _, match_kw = kw["match"]
-    assert match_kw["ipv4_src"] == "10.0.0.5"
+    assert len(dp.sent) == 2     # DELETE + ADD
+    for _, kw in dp.sent:
+        _, match_kw = kw["match"]
+        assert match_kw["ipv4_src"] == "10.0.0.5"
     assert ("ip", "10.0.0.5") in app.mitigated
 
 
@@ -525,9 +545,9 @@ def _t8():
     app, dp = _make_app(), _make_dp()
     pairs = [(_flow_stat("10.0.0.5"),
               {"is_anomaly": True, "attack_type": "DoS", "confidence": 0.95})]
-    app._mitigate(dp, pairs)        # primera vez -> bloquea
-    app._mitigate(dp, pairs)        # segunda vez dentro del timeout
-    assert len(dp.sent) == 1        # no se duplica
+    app._mitigate(dp, pairs)        # primera vez -> envía DELETE + ADD
+    app._mitigate(dp, pairs)        # segunda vez dentro del timeout: nada
+    assert len(dp.sent) == 2        # solo los 2 de la primera, no se duplica
 
 
 @_case("_flow_removed_handler limpia self.mitigated al expirar el bloqueo en OVS")

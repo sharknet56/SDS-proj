@@ -117,9 +117,15 @@ class DetectApp(app_manager.RyuApp):
         dp = ev.msg.datapath
         self.datapaths[dp.id] = dp
         p = dp.ofproto_parser
+        # idle=0 -> la table-miss entry es PERMANENTE. Si tuviera idle_timeout
+        # se moriría durante ataques largos: el flujo del ataque matchea reglas
+        # de mayor prioridad (prio=1 forwarding, prio=100 bloqueo) y la catch-all
+        # se queda 30s sin matchear nada -> OVS la borra -> el switch deja de
+        # mandar packet_in al controlador -> red muerta hasta reiniciar Ryu.
         self._add_flow(dp, 0, p.OFPMatch(),
                        [p.OFPActionOutput(dp.ofproto.OFPP_CONTROLLER,
-                                          dp.ofproto.OFPCML_NO_BUFFER)])
+                                          dp.ofproto.OFPCML_NO_BUFFER)],
+                       idle=0)
 
     def _add_flow(self, dp, prio, match, actions, idle=30):
         p = dp.ofproto_parser
@@ -304,31 +310,68 @@ class DetectApp(app_manager.RyuApp):
 
     def _block_ip(self, dp, ip_src):
         p = dp.ofproto_parser
+        ofp = dp.ofproto
         match = p.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=ip_src)
+
         # OFPFF_SEND_FLOW_REM: notificación de expiración -> _flow_removed_handler
         # limpia self.mitigated y emite active=0 a Influx (ver bug #6).
         dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
                                  hard_timeout=MIT_TIMEOUT,
-                                 flags=dp.ofproto.OFPFF_SEND_FLOW_REM,
+                                 flags=ofp.OFPFF_SEND_FLOW_REM,
                                  instructions=[]))
         self.logger.warning("[MITIGACION] DoS -> bloqueo IP origen %s durante %ds",
                             ip_src, MIT_TIMEOUT)
         self._influx_write("blocks", tags={"type": "DoS", "target": ip_src},
                            fields={"active": 1, "expires": time.time() + MIT_TIMEOUT})
 
+        # Borrar primero las reglas de forwarding (prio=1) con esta IP como
+        # origen. Si no se hace, quedan vivas durante su idle_timeout (30s) con
+        # packet_count/byte_count acumulados del ataque, y flow_stats_reply_handler
+        # las sigue viendo: como el delta de paquetes es 0 pero avg_packet_size y
+        # flow_duration_sec son los del ataque, el modelo las clasifica como DoS
+        # fantasma durante 30s tras la mitigación (rachas que crecen sin parar).
+        # Esto se envía ANTES del install del bloqueo: OFPFC_DELETE no filtra por
+        # prioridad, así que si se hiciera después borraría el bloqueo recién
+        # puesto. La ventana de carrera entre delete e install es de microsegundos.
+        dp.send_msg(p.OFPFlowMod(
+            datapath=dp, command=ofp.OFPFC_DELETE,
+            out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
+            match=match,
+        ))
+
     def _block_mac(self, dp, mac_src):
         p = dp.ofproto_parser
+        ofp = dp.ofproto
+        ips_to_clear = [ip for ip, mac in self.ip_to_mac.items() if mac == mac_src]
+
         # Match en L2: cualquier paquete con esa MAC origen. Instrucciones
         # vacías = drop. Prioridad 100 para ganar a las reglas IP de p=1.
         match = p.OFPMatch(eth_src=mac_src)
         dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
                                  hard_timeout=MIT_TIMEOUT,
-                                 flags=dp.ofproto.OFPFF_SEND_FLOW_REM,
+                                 flags=ofp.OFPFF_SEND_FLOW_REM,
                                  instructions=[]))
-        self.logger.warning("[MITIGACION] DDoS -> bloqueo MAC origen %s durante %ds",
-                            mac_src, MIT_TIMEOUT)
+        self.logger.warning("[MITIGACION] DDoS -> bloqueo MAC origen %s durante %ds "
+                            "(+%d reglas forwarding limpiadas)",
+                            mac_src, MIT_TIMEOUT, len(ips_to_clear))
         self._influx_write("blocks", tags={"type": "DDoS", "target": mac_src},
                            fields={"active": 1, "expires": time.time() + MIT_TIMEOUT})
+
+        # Borrar las prio=1 de forwarding asociadas a esta MAC. Las reglas
+        # prio=1 NO llevan eth_src en el match (solo ipv4_src/ipv4_dst/ip_proto/
+        # tcp_dst), así que un DELETE por eth_src directo no las alcanzaría.
+        # Resolvemos vía self.ip_to_mac (poblado en packet_in_handler): todas
+        # las IPs que vimos asociadas a esta MAC son candidatas a borrar. Con
+        # --rand-source pueden ser cientos; cada una va en su propio FlowMod.
+        # Sin esto, las prio=1 fantasma persisten 30s con stats acumulados y
+        # falsean clasificaciones siguientes (ver bloque de _block_ip).
+        for ip in ips_to_clear:
+            ip_match = p.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=ip)
+            dp.send_msg(p.OFPFlowMod(
+                datapath=dp, command=ofp.OFPFC_DELETE,
+                out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
+                match=ip_match,
+            ))
 
     def _ask_detector(self, feats_list):
         results = []

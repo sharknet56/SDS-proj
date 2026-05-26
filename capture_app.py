@@ -66,10 +66,15 @@ class CaptureApp(app_manager.RyuApp):
         dp = ev.msg.datapath
         self.datapaths[dp.id] = dp
         p = dp.ofproto_parser
-        # regla por defecto: lo no reconocido va al controlador
+        # regla por defecto: lo no reconocido va al controlador.
+        # idle=0 -> la table-miss entry es PERMANENTE. Durante capturas largas
+        # de un único flujo (típico en escenarios DoS o iperf), todo el tráfico
+        # matchea la prio=1 y la catch-all se queda sin actividad. Si caducara
+        # OVS dejaría de mandar packet_in y la captura se cortaría a mitad.
         self._add_flow(dp, 0, p.OFPMatch(),
                        [p.OFPActionOutput(dp.ofproto.OFPP_CONTROLLER,
-                                          dp.ofproto.OFPCML_NO_BUFFER)])
+                                          dp.ofproto.OFPCML_NO_BUFFER)],
+                       idle=0)
 
     def _add_flow(self, dp, prio, match, actions, idle=30):
         p = dp.ofproto_parser
