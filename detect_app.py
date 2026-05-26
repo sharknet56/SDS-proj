@@ -77,7 +77,10 @@ class DetectApp(app_manager.RyuApp):
         self.prev_keys = set()
         self.attack_streak = 0      # sondeos consecutivos con ataque
         self.in_attack = False      # para detectar el inicio de un episodio
-        self.mitigated = {}         # objetivo -> instante de expiración
+        self.mitigated = set()      # bloqueos activos. Se sincroniza con la
+                                    # tabla del switch via _flow_removed_handler:
+                                    # OVS es la fuente de la verdad, esto es
+                                    # solo una caché para deduplicar.
         self.influx = self._influx_connect()
         self.monitor_thread = hub.spawn(self._monitor)
         self.logger.info("[detect] detector %s:%d | persist=%d conf>=%.2f timeout=%ds",
@@ -121,8 +124,13 @@ class DetectApp(app_manager.RyuApp):
     def _add_flow(self, dp, prio, match, actions, idle=30):
         p = dp.ofproto_parser
         inst = [p.OFPInstructionActions(dp.ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        # OFPFF_SEND_FLOW_REM = pedirle a OVS que nos avise (EventOFPFlowRemoved)
+        # cuando borre esta regla por idle_timeout. Lo usamos para mantener
+        # ip_to_mac en sync con la tabla del switch (ver _flow_removed_handler).
         dp.send_msg(p.OFPFlowMod(datapath=dp, priority=prio, match=match,
-                                 idle_timeout=idle, instructions=inst))
+                                 idle_timeout=idle,
+                                 flags=dp.ofproto.OFPFF_SEND_FLOW_REM,
+                                 instructions=inst))
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -160,6 +168,43 @@ class DetectApp(app_manager.RyuApp):
         dp.send_msg(p.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id,
                                    in_port=in_port, actions=actions, data=data))
 
+    @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
+    def _flow_removed_handler(self, ev):
+        """Mantiene en sync el estado del controlador con la tabla del switch.
+
+        OVS borra reglas por idle/hard_timeout, pero ip_to_mac y self.mitigated
+        son dicts/sets en memoria del controlador: no se enteran. Con
+        OFPFF_SEND_FLOW_REM activo (ver _add_flow / _block_*), OVS nos notifica
+        cada expiración y limpiamos la entrada correspondiente. Así el switch
+        es la fuente de verdad y no almacenamos timestamps de expiración aparte.
+
+        Distinguimos por prioridad:
+          - prio=1   = forwarding (instalada en packet_in) -> limpia ip_to_mac.
+                       Sin esto, --rand-source (cada SYN tiene IP origen distinta
+                       de un solo uso) acumula entradas indefinidamente.
+          - prio=100 = bloqueo de mitigación (DoS por IP, DDoS por MAC) ->
+                       limpia self.mitigated y escribe active=0 a Influx.
+        """
+        msg = ev.msg
+        match = msg.match
+        ipv4_src = lf.mget(match, "ipv4_src", None)
+        eth_src = lf.mget(match, "eth_src", None)
+
+        if msg.priority == 100:
+            if ipv4_src:
+                key, atype = ("ip", ipv4_src), "DoS"
+            elif eth_src:
+                key, atype = ("mac", eth_src), "DDoS"
+            else:
+                return
+            self.mitigated.discard(key)
+            self._influx_write("blocks",
+                               tags={"type": atype, "target": key[1]},
+                               fields={"active": 0, "expires": time.time()})
+        else:
+            if ipv4_src:
+                self.ip_to_mac.pop(ipv4_src, None)
+
     # ---------- sondeo + detección ----------
     def _monitor(self):
         while True:
@@ -169,8 +214,6 @@ class DetectApp(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def flow_stats_reply_handler(self, ev):
-        self._prune_blocks()   # marca como expiradas (active=0) las mitigaciones vencidas
-
         stats = [s for s in ev.msg.body if s.priority == 1]
         if not stats:
             return
@@ -227,7 +270,6 @@ class DetectApp(app_manager.RyuApp):
 
     # ---------- mitigación ----------
     def _mitigate(self, dp, pairs):
-        now = time.time()
         for stat, v in pairs:
             if not v.get("is_anomaly") or v.get("confidence", 0) < MIT_MIN_CONF:
                 continue
@@ -238,10 +280,10 @@ class DetectApp(app_manager.RyuApp):
                 if not ip_src:
                     continue
                 key = ("ip", ip_src)
-                if self._recent(key, now):
+                if key in self.mitigated:
                     continue
                 self._block_ip(dp, ip_src)
-                self.mitigated[key] = now + MIT_TIMEOUT
+                self.mitigated.add(key)
             elif atype == "DDoS":
                 # El flow_stat NO trae eth_src (instalamos los flujos casando
                 # por IP, no por MAC). Resolvemos IP→MAC con el mapa que
@@ -255,31 +297,20 @@ class DetectApp(app_manager.RyuApp):
                                         "salto este flujo", ip_src)
                     continue
                 key = ("mac", mac_src)
-                if self._recent(key, now):
+                if key in self.mitigated:
                     continue
                 self._block_mac(dp, mac_src)
-                self.mitigated[key] = now + MIT_TIMEOUT
-
-    def _recent(self, key, now):
-        return key in self.mitigated and self.mitigated[key] > now
-
-    def _prune_blocks(self):
-        now = time.time()
-        for key, exp in list(self.mitigated.items()):
-            if exp <= now:
-                # key[0] == "ip"  -> DoS, target = IP origen
-                # key[0] == "mac" -> DDoS, target = MAC origen
-                atype = "DoS" if key[0] == "ip" else "DDoS"
-                self._influx_write("blocks",
-                                   tags={"type": atype, "target": key[1]},
-                                   fields={"active": 0, "expires": float(exp)})
-                del self.mitigated[key]
+                self.mitigated.add(key)
 
     def _block_ip(self, dp, ip_src):
         p = dp.ofproto_parser
         match = p.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=ip_src)
+        # OFPFF_SEND_FLOW_REM: notificación de expiración -> _flow_removed_handler
+        # limpia self.mitigated y emite active=0 a Influx (ver bug #6).
         dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
-                                 hard_timeout=MIT_TIMEOUT, instructions=[]))
+                                 hard_timeout=MIT_TIMEOUT,
+                                 flags=dp.ofproto.OFPFF_SEND_FLOW_REM,
+                                 instructions=[]))
         self.logger.warning("[MITIGACION] DoS -> bloqueo IP origen %s durante %ds",
                             ip_src, MIT_TIMEOUT)
         self._influx_write("blocks", tags={"type": "DoS", "target": ip_src},
@@ -291,7 +322,9 @@ class DetectApp(app_manager.RyuApp):
         # vacías = drop. Prioridad 100 para ganar a las reglas IP de p=1.
         match = p.OFPMatch(eth_src=mac_src)
         dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
-                                 hard_timeout=MIT_TIMEOUT, instructions=[]))
+                                 hard_timeout=MIT_TIMEOUT,
+                                 flags=dp.ofproto.OFPFF_SEND_FLOW_REM,
+                                 instructions=[]))
         self.logger.warning("[MITIGACION] DDoS -> bloqueo MAC origen %s durante %ds",
                             mac_src, MIT_TIMEOUT)
         self._influx_write("blocks", tags={"type": "DDoS", "target": mac_src},

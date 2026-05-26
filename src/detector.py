@@ -21,6 +21,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+# Normaliza las etiquetas del CSV a la forma canónica. "Normal" (con mayúscula)
+# es importante porque Detector.predict decide is_anomaly comparando con "Normal".
+LABEL_MAP = {"normal": "Normal", "dos": "DoS", "ddos": "DDoS"}
+
 
 class Autoencoder(nn.Module):
     """Misma arquitectura usada en `notebooks/03_anomaly_detector.ipynb`.

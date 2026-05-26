@@ -1,6 +1,6 @@
 # SDS-proj — Detección de DDoS en SDN
 
-Proyecto de la asignatura **Software Defined Security**. Detección de ataques DDoS sobre una red SDN (Mininet + Ryu) mediante un modelo de ML que aprende el comportamiento normal de la red y define un umbral dinámico de anomalía.
+Proyecto de la asignatura **Software Defined Security**. Detección de ataques DDoS sobre una red SDN (Mininet + Ryu) mediante un modelo de ML que aprende el comportamiento normal de la red y aplica un umbral de anomalía aprendido en entrenamiento.
 
 ## División del equipo
 
@@ -14,38 +14,42 @@ Documentación del sistema desplegado:
 - [`docs/grafana.md`](docs/grafana.md) — paneles de Grafana sobre las métricas que escribe `detect_app.py`.
 - [`CLAUDE.md`](CLAUDE.md) — guía de orientación para futuras sesiones de Claude Code.
 
-> El resto de este README es la propuesta original del proyecto. Para lo que está realmente desplegado, ver los docs de arriba.
-
 ## Enfoque
 
 Pipeline híbrido en dos etapas:
 
-1. **Detector de anomalías no supervisado** (Autoencoder / Isolation Forest) entrenado solo con tráfico benigno. Define el umbral de forma dinámica como percentil del error de reconstrucción sobre una ventana deslizante.
-2. **Clasificador supervisado** (XGBoost) que confirma si la anomalía es DDoS y clasifica el tipo de ataque.
+1. **Detector de anomalías no supervisado** (Autoencoder) entrenado solo con tráfico benigno. El umbral se fija en entrenamiento como el **percentil 99 del error de reconstrucción** sobre un split de validación de tráfico normal — es decir, "el 1% de los flujos legítimos ya da un error de este nivel; por encima lo consideramos sospechoso". El proceso, paso a paso:
+   1. Se separa el 70/30 de los flujos `Normal` en `train` / `val`.
+   2. El AE se entrena solo con el 70%.
+   3. Se calcula el error de reconstrucción sobre el 30% (datos que el AE no ha visto).
+   4. El umbral es `np.percentile(errores_val, 99)`. Se guarda en `models/detector_meta.pkl` y lo carga `Detector.load()`.
+
+   El umbral es **estático** porque en este escenario (Mininet, topología fija, tráfico reproducible) no hay deriva de distribución entre entreno y producción. Un umbral dinámico (percentil rolling sobre ventana deslizante) tendría sentido en un despliegue real con drift; aquí sería resolver un problema que no tenemos.
+2. **Clasificador supervisado** (XGBoost multiclase: Normal / DoS / DDoS) que confirma si la anomalía es ataque y clasifica el tipo.
 
 ## Dataset
 
-[InSDN (2020)](https://www.kaggle.com/datasets/muhammadumarjavaid/insdn-dataset-2020) — flows capturados en una topología SDN con Ryu y OvS, etiquetados.
+Capturado por nosotros con [`scripts/capture_full.py`](scripts/capture_full.py), que lanza Mininet a través de 15 escenarios canónicos (3 Normal + 8 DoS + 4 DDoS) y vuelca las features a `data/dataset.csv`. La propuesta inicial usaba el dataset público InSDN, pero fue descartado porque el skew entre sus features y las derivables de OpenFlow live era demasiado grande — al capturar nosotros mismos garantizamos que el modelo offline ve exactamente lo mismo que el detector en vivo.
 
 ## Estructura del repo
 
 ```
 SDS-proj/
 ├── data/
-│   ├── raw/              # InSDN sin tocar (no versionado)
-│   └── processed/        # Tras limpieza y feature engineering
-├── notebooks/
-│   ├── 01_eda.ipynb              # Exploración del dataset
-│   ├── 02_baseline_rf.ipynb      # Random Forest como techo de referencia
-│   ├── 03_anomaly_detector.ipynb # Autoencoder / Isolation Forest
-│   └── 04_classifier.ipynb       # XGBoost
+│   └── dataset.csv        # capturado por scripts/capture_full.py
 ├── src/
-│   ├── features.py       # Feature engineering reutilizable
-│   ├── detector.py       # Clase final con load() / predict()
-│   └── train.py          # Script de entrenamiento reproducible
-├── models/               # Modelos entrenados (.pkl / .pt)
-├── docs/
-│   └── INTERFACE.md      # Contrato con el subgrupo de topología
+│   ├── live_features.py   # extracción de las 13 features (capture + detect)
+│   ├── detector.py        # Detector.load() / predict() — API del modelo
+│   └── train.py           # entrena AE + XGBoost desde data/dataset.csv
+├── models/                # artefactos entrenados (no versionados)
+├── scripts/
+│   └── capture_full.py    # captura el dataset desde cero
+├── capture_app.py         # Ryu app: captura labeled flow-stats -> CSV
+├── detect_app.py          # Ryu app: detección + mitigación en vivo
+├── serve_detector.py      # servidor TCP que envuelve Detector.load()
+├── test_bench.py          # banco de pruebas
+├── docs/                  # INTERFACE.md, Summary.md, setup.md, grafana.md
+├── grafana/               # dashboard de Grafana exportado
 ├── requirements.txt
 └── README.md
 ```
@@ -58,41 +62,22 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Descargar InSDN
-
-Usamos `kagglehub` (versión ≥ 0.4.1). Crear un API token en https://www.kaggle.com/settings → *Create new token* y guardarlo en un `.env` en la raíz del repo (ya está en `.gitignore`):
-
-```bash
-# .env
-KAGGLE_API_TOKEN=tu_api_token
-```
-
-Alternativamente, el formato clásico `KAGGLE_USERNAME` + `KAGGLE_KEY` también funciona.
-
-Después, desde un notebook o script:
-
-```python
-from src.data import get_insdn_path
-path = get_insdn_path()      # descarga si hace falta, cachea en ~/.cache/kagglehub/
-print(path)
-```
+Para los detalles operativos (versiones de Python, captura del dataset, despliegue de Ryu/InfluxDB/Grafana) ver [`docs/setup.md`](docs/setup.md).
 
 ## Uso
 
-Para explorar: abrir los notebooks en orden.
-
-Para entrenar el modelo final:
+Entrenar el modelo desde el CSV capturado:
 
 ```bash
 python -m src.train
 ```
 
-Para usarlo desde la Ryu app del subgrupo B:
+Usarlo desde la Ryu app:
 
 ```python
 from src.detector import Detector
 
 detector = Detector.load("models/")
 result = detector.predict(features_dict)
-# {"is_anomaly": True, "attack_type": "syn_flood", "confidence": 0.93}
+# DetectionResult(is_anomaly=True, attack_type='DoS', confidence=0.97, anomaly_score=12.7)
 ```

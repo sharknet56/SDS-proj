@@ -4,11 +4,11 @@
 
 Entrena tres modelos y compara dos enfoques de clasificación:
 
-    data/dataset.csv  (11 features + label)
+    data/dataset.csv  (13 features + label)
         │  limpieza de duplicados
         ▼
         ├─ ETAPA 1: AUTOENCODER  (no supervisado, solo tráfico Normal)
-        │     11 → 16 → 8 → 4 → 8 → 16 → 11   → error de reconstrucción
+        │     13 → 16 → 8 → 4 → 8 → 16 → 13   → error de reconstrucción
         │     umbral = P99 del error sobre Normal       → ¿es un ataque?
         │
         ├─ ETAPA 2a: XGBoost MULTICLASE  {Normal, DoS, DDoS}   ← se GUARDA (producción)
@@ -39,17 +39,13 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-from src.detector import Autoencoder
+from src.detector import LABEL_MAP, Autoencoder
 
 ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "models"
 DATASET = ROOT / "data" / "dataset.csv"
 RANDOM_STATE = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Normaliza las etiquetas del CSV a una forma canónica. "Normal" (con mayúscula)
-# es importante porque src/detector.py decide is_anomaly comparando con "Normal".
-LABEL_MAP = {"normal": "Normal", "dos": "DoS", "ddos": "DDoS"}
 
 DEDUP = True
 

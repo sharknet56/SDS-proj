@@ -59,9 +59,6 @@ sudo python3 scripts/capture_full.py
 CAPTURE_LABEL=normal  CAPTURE_CSV=data/dataset.csv CAPTURE_FILTER_IDLE=1 ryu-manager capture_app.py
 CAPTURE_LABEL=dos     CAPTURE_CSV=data/dataset.csv CAPTURE_FILTER_IDLE=1 ryu-manager capture_app.py
 CAPTURE_LABEL=ddos    CAPTURE_CSV=data/dataset.csv CAPTURE_FILTER_IDLE=1 ryu-manager capture_app.py
-
-# Jupyter notebooks (EDA and model exploration only)
-jupyter lab notebooks/
 ```
 
 Three-terminal stack for live operation: (1) `python serve_detector.py`, (2) `ryu-manager detect_app.py`, (3) Mininet traffic.
@@ -72,8 +69,7 @@ Three-terminal stack for live operation: (1) `python serve_detector.py`, (2) `ry
 src/
 ├── live_features.py   ← canonical feature extraction (shared by capture + detect)
 ├── detector.py        ← Detector class: public API for both serve_detector and tests
-├── train.py           ← trains from data/dataset.csv; saves all artefacts to models/
-└── features.py        ← InSDN-specific mappings (used only in exploratory notebooks)
+└── train.py           ← trains from data/dataset.csv; saves all artefacts to models/
 
 capture_app.py         ← Ryu app: captures labeled flow-stats → CSV
 detect_app.py          ← Ryu app: detects attacks + installs mitigation rules
@@ -90,13 +86,11 @@ test_bench.py          ← canonical test cases + CSV evaluation
 
 The two **destination-diversity** features (`dst_ip_entropy`, `num_distinct_dst_ips`) are what let the model distinguish "1 → N" multi-target attacks from "N → 1" classic DDoS, and benign mesh traffic (pingall) from multi-target floods (rate is the discriminator there).
 
-`src/features.py` contains InSDN-to-OpenFlow mappings with different names (e.g. `pkts_per_sec`, `avg_pkt_size`, `flow_age_sec`) — these are used only in the exploratory notebooks, **not** at training/inference time. The example in `README.md` still uses the InSDN names and is stale — trust `src/live_features.py:COLUMNS`. The deployed architecture (Ryu app ↔ detector socket, mitigation flow, all ports/paths/knobs) lives in [docs/INTERFACE.md](docs/INTERFACE.md), and the model/scenarios writeup in [docs/Summary.md](docs/Summary.md).
-
-A few docstrings still say "11 features" (e.g. [detect_app.py:3](detect_app.py#L3)). They are stale — the count is 13.
+The deployed architecture (Ryu app ↔ detector socket, mitigation flow, all ports/paths/knobs) lives in [docs/INTERFACE.md](docs/INTERFACE.md), and the model/scenarios writeup in [docs/Summary.md](docs/Summary.md).
 
 ### Training data
 
-`python -m src.train` reads `data/dataset.csv` (captured by `scripts/capture_full.py` driving Mininet through 15 canonical scenarios), **not** InSDN. InSDN is used only in `notebooks/01–04` for exploratory work. Labels in the CSV are lowercase (`normal`, `dos`, `ddos`); `train.py` maps them to `Normal`, `DoS`, `DDoS`. Duplicate rows are dropped (`DEDUP=True`).
+`python -m src.train` reads `data/dataset.csv` (captured by `scripts/capture_full.py` driving Mininet through 15 canonical scenarios). The original project proposal referenced the InSDN dataset, but it was discarded in favor of our own Mininet captures; the exploratory notebooks that used it have been removed. Labels in the CSV are lowercase (`normal`, `dos`, `ddos`); `train.py` maps them to `Normal`, `DoS`, `DDoS`. Duplicate rows are dropped (`DEDUP=True`).
 
 The AE anomaly threshold is the percentile `AE_THRESHOLD_PERCENTILE` (default 99) of reconstruction error on the Normal validation split — tunable at the top of `src/train.py`. `Detector.predict(features, threshold=…)` also accepts a per-call override, which is the hook for a dynamic-threshold strategy in the Ryu app.
 
@@ -111,7 +105,7 @@ The AE anomaly threshold is the percentile `AE_THRESHOLD_PERCENTILE` (default 99
 | `label_encoder.pkl` / `label_encoder_binary.pkl` | Corresponding LabelEncoders |
 | `detector_meta.pkl` | Feature names, AE threshold (P99), architecture dims |
 
-The Autoencoder architecture (`Linear 13→16→8→4→8→16→13`, ReLU, MSE) is defined in [src/detector.py:25-46](src/detector.py#L25-L46) and duplicated in `notebooks/03_anomaly_detector.ipynb`. If you change the architecture, both must stay in sync and models must be retrained.
+The Autoencoder architecture (`Linear 13→16→8→4→8→16→13`, ReLU, MSE) is defined in [src/detector.py:25-46](src/detector.py#L25-L46). If you change the architecture, models must be retrained.
 
 ### Detection flow
 

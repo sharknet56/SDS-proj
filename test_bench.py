@@ -21,10 +21,9 @@ from pathlib import Path
 import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-from src.detector import Detector
+from src.detector import LABEL_MAP, Detector
 
 ROOT = Path(__file__).resolve().parent
-LABEL_MAP = {"normal": "Normal", "dos": "DoS", "ddos": "DDoS"}
 
 det = Detector.load(ROOT / "models")
 print("Detector cargado. Features:", det.feature_names)
@@ -335,7 +334,7 @@ def _make_app():
     app.prev_keys = set()
     app.attack_streak = 0
     app.in_attack = False
-    app.mitigated = {}
+    app.mitigated = set()
     app.influx = None
     app.logger = MagicMock()
     return app
@@ -424,7 +423,7 @@ def _t3():
               {"is_anomaly": True, "attack_type": "DoS", "confidence": 0.5})]
     app._mitigate(dp, pairs)
     assert dp.sent == []
-    assert app.mitigated == {}
+    assert app.mitigated == set()
 
 
 @_case("_mitigate ignora veredictos con is_anomaly=False")
@@ -441,7 +440,7 @@ def _t4():
               {"is_anomaly": False, "attack_type": "Normal", "confidence": 0.99})]
     app._mitigate(dp, pairs)
     assert dp.sent == []
-    assert app.mitigated == {}
+    assert app.mitigated == set()
 
 
 @_case("_mitigate DoS bloquea IP origen y registra clave ('ip', ip)")
@@ -507,7 +506,7 @@ def _t7():
               {"is_anomaly": True, "attack_type": "DDoS", "confidence": 0.95})]
     app._mitigate(dp, pairs)
     assert dp.sent == []
-    assert app.mitigated == {}
+    assert app.mitigated == set()
     app.logger.warning.assert_called()
 
 
@@ -531,22 +530,30 @@ def _t8():
     assert len(dp.sent) == 1        # no se duplica
 
 
-@_case("_prune_blocks libera mitigaciones vencidas y conserva activas")
+@_case("_flow_removed_handler limpia self.mitigated al expirar el bloqueo en OVS")
 def _t9():
     """
-    Escenario : self.mitigated tiene dos entradas — una con instante de
-                expiración en el pasado (vencida) y otra en el futuro (activa).
-    Acción    : _prune_blocks() (se llama al principio de cada sondeo).
-    Esperado  : la vencida se elimina del diccionario (deja paso a futuras
-                mitigaciones de ese mismo target); la activa permanece.
-    Verifica  : el ciclo de vida de las mitigaciones es consistente — sin
-                esto, _recent() seguiría bloqueando reactivaciones tras
-                pasar el timeout.
+    Escenario : OVS expira una regla de bloqueo (prio=100) por hard_timeout y
+                envía EventOFPFlowRemoved al controlador. Hay dos bloqueos en
+                self.mitigated: uno para el flujo que expira y otro intacto.
+    Acción    : _flow_removed_handler con un msg de prio=100 cuyo match contiene
+                la ipv4_src del bloqueo expirado (caso DoS).
+    Esperado  : la entrada ('ip', <ip>) desaparece de self.mitigated; la otra
+                permanece. Esto deja paso a futuras mitigaciones del mismo target.
+    Verifica  : el ciclo de vida de las mitigaciones queda atado a la verdad
+                de OVS — no a una estimación basada en time.time() en Python.
+                Sustituye al antiguo _prune_blocks que vivía de timestamps.
     """
     app = _make_app()
-    app.mitigated[("ip", "10.0.0.8")] = time.time() - 5            # vencida
-    app.mitigated[("mac", "aa:bb:cc:00:00:09")] = time.time() + 100  # activa
-    app._prune_blocks()
+    app.mitigated.add(("ip", "10.0.0.8"))
+    app.mitigated.add(("mac", "aa:bb:cc:00:00:09"))
+
+    # Fingimos el evento que enviaría OVS al expirar la regla de bloqueo de 10.0.0.8.
+    ev = MagicMock()
+    ev.msg.priority = 100
+    ev.msg.match = {"ipv4_src": "10.0.0.8"}
+    app._flow_removed_handler(ev)
+
     assert ("ip", "10.0.0.8") not in app.mitigated
     assert ("mac", "aa:bb:cc:00:00:09") in app.mitigated
 

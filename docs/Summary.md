@@ -35,6 +35,18 @@ attack_type ∈ {Normal, DoS, DDoS}
 - Cascada AE → XGBoost: el AE actúa como filtro barato (el 95%+ del tráfico es normal y no llega a XGBoost), XGBoost solo se invoca para flujos sospechosos.
 - Entrenamiento end-to-end en ~1 minuto sobre CPU.
 
+### Cómo se entrena el Autoencoder
+
+`_train_autoencoder` en [`src/train.py`](../src/train.py) entrena el AE durante **30 épocas fijas** sobre el split de tráfico Normal (70% train / 30% val), usando Adam con `lr=1e-3` y batches de 512. Solo se mide `train_loss` durante el entreno; el modelo final es el de la última época, no el de mejor val_loss.
+
+Hemos elegido este esquema sencillo en vez del más sofisticado (val_loss por época + restauración del mejor checkpoint + early stopping) porque:
+
+- **El AE separa con margen amplísimo.** Tras 30 épocas el error de reconstrucción máximo en Normal es 5.5; la mediana en DoS/DDoS es ≈9000+ (ratio >1500×). El umbral P99 cae en 4.19. No hay un escenario plausible donde un overfitting marginal en las últimas épocas mueva el umbral lo suficiente como para confundir un ataque con tráfico normal.
+- **El dataset es pequeño y estable.** ~10k filas de Normal en una topología fija. El AE no tiene "más allá" que aprender — converge rápido y los pesos se estabilizan antes de las 30 épocas. No hay margen para overfitting observable.
+- **Reproducibilidad por encima de optimalidad.** 30 épocas fijas es un protocolo determinista (con `random_state=42` cualquiera reproduce los mismos pesos). Un early-stopping introduciría un criterio de parada dependiente del val-loss observado, que añade variabilidad sin beneficio detectable.
+
+Si en el futuro se amplía el dataset, se añaden features o se observa overfitting en algún escenario nuevo, conviene revisar este criterio y pasar a selección por mejor val-loss (~10 líneas en `_train_autoencoder`).
+
 ### Las 13 features
 
 **Por flujo (7)** — describen UN flujo concreto:
@@ -476,6 +488,9 @@ det.default_threshold    # P99 del error AE sobre validación Normal
 - Comparar AE+XGBoost contra baselines más simples (RF puro, threshold por feature) para la memoria.
 - **Whitelist de IPs internas** (trabajo futuro): integrar una lista de servidores corporativos conocidos (SMTP, bastión, balancer) que se eximen del filtro. Cierra los casos "estructuralmente ambiguos".
 - **Feature de bidireccionalidad** (trabajo futuro): emparejar flujos forward/return en `live_features.py` y añadir un ratio que mida si la conexión es bidireccional simétrica (descarga real) o asimétrica brutal (flood). Cerraría el caso del bulk-download a alta tasa.
+- **Seguimiento de conexiones establecidas** (trabajo futuro): mantener una tabla `(src_ip, dst_ip, src_port, dst_port, proto) → estado_TCP` (SYN_SENT, ESTABLISHED, FIN_WAIT...) actualizada con cada `packet_in` y exponerlo como feature. Hoy el detector solo ve agregados por ventana — no distingue "5000 pps sobre 1 conexión ESTABLISHED" (descarga legítima) de "5000 pps de SYNs sueltos" (flood), más allá de `new_flows_per_sec`. Una feature "% de paquetes pertenecientes a conexiones ESTABLISHED" haría binaria esta distinción. Es lo que más directamente explicaría el FAIL del caso 3 del test bench (descarga GbE sostenida con `new_flows≈0`). Implementación: extender `live_features.py` para procesar `packet_in` además de `flow_stats`, parsear flags TCP (SYN/ACK/FIN/RST) y mantener una máquina de estados por 5-tupla con expiración por timeout. Requiere reentrenar con captura nueva que incluya la feature.
+- **Inspección de paquetes (DPI)** (trabajo futuro): pasar los primeros N bytes del payload por un parser ligero (cabeceras HTTP, métodos, content-type, host) para confirmar la naturaleza del flujo — "este flujo de alto volumen es un `GET /big.bin` con `Content-Type: application/octet-stream`, no un flood". Es la confirmación de último recurso, complementaria al modelo estadístico, y la única vía para distinguir descargas legítimas de floods que estructuralmente son idénticos a nivel de flow-stats (mismo caso del bulk-download). Implicaciones: el detector dejaría de ser solo flow-level (rompe la pureza del diseño actual, que es 100% derivable de OpenFlow), requiere mirror-port o `output:CONTROLLER` con `max_len` mayor, y multiplica el coste de inferencia. Solo merece la pena si el escenario de descarga legítima es crítico para el caso de uso.
+- **Rate-limit en vez de drop para DoS** (trabajo futuro): hoy `_block_ip` instala una regla de drop puro (instrucciones vacías) para el atacante DoS. Una política más realista sería **degradar** en vez de **cortar**, porque una fuente única identificable puede ser un host legítimo comprometido (malware, browser hijack) — no necesariamente un atacante puro. Implementación: usar `OFPMeterMod` de OpenFlow 1.3 con un rate de p.ej. 64 kbps y `OFPMBT_DROP` del exceso, más una `OFPInstructionMeter` en la regla de mitigación. DDoS se mantiene como drop (muchas fuentes, no recuperables). Requiere verificar que el OVS del entorno soporte meters (kernel datapath estándar a veces los ignora silenciosamente) y actualizar el measurement `blocks` de InfluxDB con un campo `policy` (`drop` / `ratelimit`).
 - Capturar uno o dos escenarios Normal largos si se va a desplegar en producción (límite de `flow_duration_sec`).
 
 ## Estado actual de validación
