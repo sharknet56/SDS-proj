@@ -49,7 +49,7 @@ MIT_COOKIE = 0xCAFE      # cookie mágico para las reglas drop priority=100; nos
 MIT_DOS_MIN_PPS = 50          # un DoS real va a >>50 pps; un ping va a 1-2 pps
 MIT_DDOS_MIN_NEW_FLOWS = 5    # nuevos flujos/seg típicos de DDoS spoofed
 MIT_DDOS_MIN_DISTINCT_SRCS = 10  # IPs origen distintas en la ventana
-MIT_TIMEOUT = 1200         # segundos que dura la regla (luego expira sola)
+MIT_TIMEOUT = 60         # segundos que dura la regla (luego expira sola)
 
 
 class DetectApp(app_manager.RyuApp):
