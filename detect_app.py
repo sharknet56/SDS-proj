@@ -34,6 +34,18 @@ from ryu.ofproto import ofproto_v1_3
 
 from src import live_features as lf
 
+try:
+    from influxdb import InfluxDBClient
+    HAVE_INFLUX = True
+except ImportError:
+    HAVE_INFLUX = False
+
+# --- InfluxDB para alimentar el dashboard de Grafana ---
+INFLUX_ENABLED = True
+INFLUX_HOST = "127.0.0.1"
+INFLUX_PORT = 8086
+INFLUX_DB = "SDS"
+
 POLL = 2
 DETECTOR_ADDR = ("127.0.0.1", 9999)
 
@@ -70,6 +82,10 @@ class DetectApp(app_manager.RyuApp):
         self.ip_to_mac = {}         # ip_src -> eth_src aprendido en packet_in
         self.blocked_macs = {}      # eth_src -> instante de expiración
         self.blocked_ips = {}       # ipv4_src -> instante de expiración
+        # Para Influx: (type, target) -> instante de expiración. Cuando llega
+        # ese instante escribimos active=0 para que el dashboard vea la transición.
+        self._block_expiry_pending = {}
+        self.influx = self._influx_connect()
         self.monitor_thread = hub.spawn(self._monitor)
         self.logger.info("[detect] detector en %s:%d | mitigacion: persist=%d conf>=%.2f timeout=%ds",
                          DETECTOR_ADDR[0], DETECTOR_ADDR[1],
@@ -145,9 +161,45 @@ class DetectApp(app_manager.RyuApp):
         dp.send_msg(p.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id,
                                    in_port=in_port, actions=actions, data=data))
 
+    # ---------- InfluxDB ----------
+    def _influx_connect(self):
+        if not (INFLUX_ENABLED and HAVE_INFLUX):
+            self.logger.info("[influx] desactivado o libreria ausente; sigo sin metricas")
+            return None
+        try:
+            c = InfluxDBClient(host=INFLUX_HOST, port=INFLUX_PORT, database=INFLUX_DB)
+            c.create_database(INFLUX_DB)
+            self.logger.info("[influx] conectado a %s:%d db=%s", INFLUX_HOST, INFLUX_PORT, INFLUX_DB)
+            return c
+        except Exception as e:
+            self.logger.error("[influx] no disponible (%s); sigo sin metricas", e)
+            return None
+
+    def _influx_write(self, measurement, fields, tags=None):
+        if not self.influx:
+            return
+        try:
+            self.influx.write_points([{"measurement": measurement,
+                                       "tags": tags or {},
+                                       "fields": fields}])
+        except Exception as e:
+            self.logger.error("[influx] write fallo: %s", e)
+
+    def _influx_flush_expired_blocks(self, now):
+        """Marca como active=0 los bloqueos cuyo timeout ha vencido."""
+        for key in list(self._block_expiry_pending.keys()):
+            exp = self._block_expiry_pending[key]
+            if exp <= now:
+                typ, tgt = key
+                self._influx_write("blocks",
+                                   {"active": 0, "expires": int(exp)},
+                                   tags={"type": typ, "target": tgt})
+                del self._block_expiry_pending[key]
+
     # ---------- sondeo + detección ----------
     def _monitor(self):
         while True:
+            self._influx_flush_expired_blocks(time.time())
             for dp in list(self.datapaths.values()):
                 dp.send_msg(dp.ofproto_parser.OFPFlowStatsRequest(dp))
             hub.sleep(POLL)
@@ -179,6 +231,18 @@ class DetectApp(app_manager.RyuApp):
 
         # Persistencia: cuenta sondeos seguidos con ataque.
         self.attack_streak = self.attack_streak + 1 if attacks > 0 else 0
+
+        # Métrica para Grafana: una muestra por sondeo. Si Influx no está,
+        # _influx_write es un no-op.
+        self._influx_write("detection", {
+            "total_flows": int(total),
+            "attacks": int(attacks),
+            "attack_streak": int(self.attack_streak),
+            "num_distinct_src_ips": int(win["num_distinct_src_ips"]),
+            "src_ip_entropy": float(win["src_ip_entropy"]),
+            "dst_port_entropy": float(win["dst_port_entropy"]),
+            "new_flows_per_sec": float(win["new_flows_per_sec"]),
+        })
         if attacks > 0:
             self.logger.warning("[ALERTA] %d/%d flujos de ataque (racha=%d)",
                                  attacks, total, self.attack_streak)
@@ -274,9 +338,15 @@ class DetectApp(app_manager.RyuApp):
                                      out_group=ofp.OFPG_ANY,
                                      match=match))
             n += 1
-        self.blocked_ips[ip_src] = time.time() + MIT_TIMEOUT
+        expires = time.time() + MIT_TIMEOUT
+        self.blocked_ips[ip_src] = expires
         self.logger.warning("[MITIGACION] DoS -> drop ipv4_src=%s en %d switch(es) durante %ds",
                             ip_src, n, MIT_TIMEOUT)
+        # Métricas para Grafana
+        self._influx_write("attack_event", {"count": 1}, tags={"type": "DoS"})
+        self._influx_write("blocks", {"active": 1, "expires": int(expires)},
+                           tags={"type": "DoS", "target": ip_src})
+        self._block_expiry_pending[("DoS", ip_src)] = expires
 
     def _block_mac(self, mac_src):
         # 1) ADD drop priority=100 con match(eth_src), cookie=MIT_COOKIE.
@@ -298,10 +368,16 @@ class DetectApp(app_manager.RyuApp):
                                      out_group=ofp.OFPG_ANY,
                                      match=match))
             n_blocks += 1
-        self.blocked_macs[mac_src] = time.time() + MIT_TIMEOUT
+        expires = time.time() + MIT_TIMEOUT
+        self.blocked_macs[mac_src] = expires
         self.logger.warning("[MITIGACION] DDoS -> drop eth_src=%s en %d switch(es) "
                             "+ limpia priority=1 propios | durante %ds",
                             mac_src, n_blocks, MIT_TIMEOUT)
+        # Métricas para Grafana
+        self._influx_write("attack_event", {"count": 1}, tags={"type": "DDoS"})
+        self._influx_write("blocks", {"active": 1, "expires": int(expires)},
+                           tags={"type": "DDoS", "target": mac_src})
+        self._block_expiry_pending[("DDoS", mac_src)] = expires
 
     def _ask_detector(self, feats_list):
         results = []
