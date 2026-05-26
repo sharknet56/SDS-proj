@@ -1,11 +1,16 @@
 """Ryu app de DETECCIÓN + MITIGACIÓN en vivo, con métricas a InfluxDB para Grafana.
 
-Calcula las 11 features (src/live_features.py, matching por IP), consulta al
+Calcula las 13 features (src/live_features.py, matching por IP), consulta al
 detector por socket, mitiga según el tipo de ataque y escribe métricas en
 InfluxDB (stack del Lab 4) para visualizarlas en Grafana.
 
-    DoS  -> bloquear la IP origen (fuente real y única)
-    DDoS -> rate-limit del tráfico hacia la víctima:puerto (origen no fiable)
+    DoS  -> bloquear la IP origen (1 fuente real y única)
+    DDoS -> bloquear la MAC origen de cada flujo atacante
+
+Lo de bloquear por MAC en DDoS no es la opción más común (lo "típico" en una
+red IP es rate-limit por destino), pero aquí es coherente con el modelo SDN:
+el controlador lo ve TODO, incluida la capa 2, y eso permite cortar al
+atacante directamente en lugar de penalizar el tráfico hacia la víctima.
 
 Salvaguardas: persistencia (N sondeos seguidos), confianza mínima y timeout.
 
@@ -50,8 +55,8 @@ DETECTOR_ADDR = ("127.0.0.1", 9999)
 MIT_PERSISTENCE = 3      # sondeos seguidos con ataque antes de actuar
 MIT_MIN_CONF = 0.80      # confianza mínima del modelo para actuar
 MIT_TIMEOUT = 30         # segundos que dura la regla (luego expira sola)
-DDOS_RATE_KBPS = 1000    # tasa a la que se limita la víctima:puerto en un DDoS
-USE_METER = True         # si los meters de tu OVS fallan, poner False (bloquea)
+                         # 30 s = visible en Grafana sin esperar entre demos.
+                         # En producción real: ~5 min con backoff por reincidencia.
 
 # --- InfluxDB (Lab 4) ---
 INFLUX_ENABLED = True
@@ -66,13 +71,13 @@ class DetectApp(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.mac_to_port = {}
+        self.ip_to_mac = {}         # ip origen -> MAC origen (poblado en packet_in)
         self.datapaths = {}
         self.prev = {}
         self.prev_keys = set()
         self.attack_streak = 0      # sondeos consecutivos con ataque
         self.in_attack = False      # para detectar el inicio de un episodio
         self.mitigated = {}         # objetivo -> instante de expiración
-        self.next_meter_id = 1
         self.influx = self._influx_connect()
         self.monitor_thread = hub.spawn(self._monitor)
         self.logger.info("[detect] detector %s:%d | persist=%d conf>=%.2f timeout=%ds",
@@ -135,6 +140,12 @@ class DetectApp(app_manager.RyuApp):
         out_port = self.mac_to_port[dp.id].get(eth.dst, ofp.OFPP_FLOOD)
         actions = [p.OFPActionOutput(out_port)]
         ip = pkt.get_protocol(ipv4.ipv4)
+        if ip:
+            # Recordamos la MAC asociada a esta IP origen. Lo usaremos al mitigar
+            # un DDoS: el detector identifica los flujos atacantes por IP, pero
+            # bloqueamos en L2 (la "gracia" de tener un controlador SDN: vemos
+            # la MAC, así que cortamos al atacante directamente).
+            self.ip_to_mac[ip.src] = eth.src
         if ip and out_port != ofp.OFPP_FLOOD:
             kwargs = dict(eth_type=ether_types.ETH_TYPE_IP,
                           ipv4_src=ip.src, ipv4_dst=ip.dst, ip_proto=ip.proto)
@@ -232,15 +243,21 @@ class DetectApp(app_manager.RyuApp):
                 self._block_ip(dp, ip_src)
                 self.mitigated[key] = now + MIT_TIMEOUT
             elif atype == "DDoS":
-                ip_dst = lf.mget(m, "ipv4_dst", None)
-                if not ip_dst:
+                # El flow_stat NO trae eth_src (instalamos los flujos casando
+                # por IP, no por MAC). Resolvemos IP→MAC con el mapa que
+                # poblamos en packet_in_handler.
+                ip_src = lf.mget(m, "ipv4_src", None)
+                if not ip_src:
                     continue
-                proto = lf.mget(m, "ip_proto", 0)
-                l4 = lf.mget(m, "tcp_dst", 0) or lf.mget(m, "udp_dst", 0) or 0
-                key = ("vp", ip_dst, l4)
+                mac_src = self.ip_to_mac.get(ip_src)
+                if not mac_src:
+                    self.logger.warning("[MITIGACION] DDoS desde %s pero MAC desconocida; "
+                                        "salto este flujo", ip_src)
+                    continue
+                key = ("mac", mac_src)
                 if self._recent(key, now):
                     continue
-                self._rate_limit(dp, ip_dst, l4, proto)
+                self._block_mac(dp, mac_src)
                 self.mitigated[key] = now + MIT_TIMEOUT
 
     def _recent(self, key, now):
@@ -250,15 +267,12 @@ class DetectApp(app_manager.RyuApp):
         now = time.time()
         for key, exp in list(self.mitigated.items()):
             if exp <= now:
-                if key[0] == "ip":
-                    tags = {"type": "DoS", "target": key[1]}
-                    fields = {"active": 0, "expires": float(exp), "port": -1,
-                              "rate_kbps": 0, "ratelimited": 0}
-                else:
-                    tags = {"type": "DDoS", "target": "%s:%s" % (key[1], key[2])}
-                    fields = {"active": 0, "expires": float(exp), "port": int(key[2]),
-                              "rate_kbps": 0, "ratelimited": 0}
-                self._influx_write("blocks", fields=fields, tags=tags)
+                # key[0] == "ip"  -> DoS, target = IP origen
+                # key[0] == "mac" -> DDoS, target = MAC origen
+                atype = "DoS" if key[0] == "ip" else "DDoS"
+                self._influx_write("blocks",
+                                   tags={"type": atype, "target": key[1]},
+                                   fields={"active": 0, "expires": float(exp)})
                 del self.mitigated[key]
 
     def _block_ip(self, dp, ip_src):
@@ -269,49 +283,19 @@ class DetectApp(app_manager.RyuApp):
         self.logger.warning("[MITIGACION] DoS -> bloqueo IP origen %s durante %ds",
                             ip_src, MIT_TIMEOUT)
         self._influx_write("blocks", tags={"type": "DoS", "target": ip_src},
-                           fields={"active": 1, "expires": time.time() + MIT_TIMEOUT,
-                                   "port": -1, "rate_kbps": 0, "ratelimited": 0})
+                           fields={"active": 1, "expires": time.time() + MIT_TIMEOUT})
 
-    def _rate_limit(self, dp, ip_dst, l4_dst, ip_proto):
+    def _block_mac(self, dp, mac_src):
         p = dp.ofproto_parser
-        ofp = dp.ofproto
-        kwargs = dict(eth_type=ether_types.ETH_TYPE_IP, ipv4_dst=ip_dst, ip_proto=ip_proto)
-        if ip_proto == 6 and l4_dst:
-            kwargs["tcp_dst"] = l4_dst
-        elif ip_proto == 17 and l4_dst:
-            kwargs["udp_dst"] = l4_dst
-        match = p.OFPMatch(**kwargs)
-
-        ratelimited = 0
-        if USE_METER:
-            try:
-                mid = self.next_meter_id
-                self.next_meter_id += 1
-                band = p.OFPMeterBandDrop(rate=DDOS_RATE_KBPS, burst_size=DDOS_RATE_KBPS)
-                dp.send_msg(p.OFPMeterMod(dp, command=ofp.OFPMC_ADD,
-                                          flags=ofp.OFPMF_KBPS, meter_id=mid, bands=[band]))
-                inst = [p.OFPInstructionMeter(mid),
-                        p.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
-                                                [p.OFPActionOutput(ofp.OFPP_NORMAL)])]
-                dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
-                                         hard_timeout=MIT_TIMEOUT, instructions=inst))
-                ratelimited = 1
-                self.logger.warning("[MITIGACION] DDoS -> rate-limit %s:%s a %d kbps durante %ds",
-                                    ip_dst, l4_dst, DDOS_RATE_KBPS, MIT_TIMEOUT)
-            except Exception as e:
-                self.logger.error("[MITIGACION] meter no disponible (%s); bloqueo temporal", e)
-
-        if not ratelimited:
-            dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
-                                     hard_timeout=MIT_TIMEOUT, instructions=[]))
-            self.logger.warning("[MITIGACION] DDoS -> bloqueo %s:%s durante %ds (sin meter)",
-                                ip_dst, l4_dst, MIT_TIMEOUT)
-
-        self._influx_write("blocks", tags={"type": "DDoS", "target": "%s:%s" % (ip_dst, l4_dst)},
-                           fields={"active": 1, "expires": time.time() + MIT_TIMEOUT,
-                                   "port": int(l4_dst),
-                                   "rate_kbps": int(DDOS_RATE_KBPS if ratelimited else 0),
-                                   "ratelimited": int(ratelimited)})
+        # Match en L2: cualquier paquete con esa MAC origen. Instrucciones
+        # vacías = drop. Prioridad 100 para ganar a las reglas IP de p=1.
+        match = p.OFPMatch(eth_src=mac_src)
+        dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
+                                 hard_timeout=MIT_TIMEOUT, instructions=[]))
+        self.logger.warning("[MITIGACION] DDoS -> bloqueo MAC origen %s durante %ds",
+                            mac_src, MIT_TIMEOUT)
+        self._influx_write("blocks", tags={"type": "DDoS", "target": mac_src},
+                           fields={"active": 1, "expires": time.time() + MIT_TIMEOUT})
 
     def _ask_detector(self, feats_list):
         results = []

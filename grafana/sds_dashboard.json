@@ -1,0 +1,520 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_INFLUXDB",
+      "label": "InfluxDB",
+      "description": "Fuente de datos InfluxDB con la base de datos SDS",
+      "type": "datasource",
+      "pluginId": "influxdb",
+      "pluginName": "InfluxDB"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "8.0.0"},
+    {"type": "datasource", "id": "influxdb", "name": "InfluxDB", "version": "1.0.0"},
+    {"type": "panel", "id": "stat", "name": "Stat", "version": ""},
+    {"type": "panel", "id": "timeseries", "name": "Time series", "version": ""},
+    {"type": "panel", "id": "barchart", "name": "Bar chart", "version": ""},
+    {"type": "panel", "id": "table", "name": "Table", "version": ""}
+  ],
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "iteration": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Ataques DoS (en la ventana)",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT count(\"count\") FROM \"attack_event\" WHERE \"type\" = 'DoS' AND $timeFilter",
+          "resultFormat": "time_series"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 1},
+              {"color": "red", "value": 10}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Ataques DDoS (en la ventana)",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT count(\"count\") FROM \"attack_event\" WHERE \"type\" = 'DDoS' AND $timeFilter",
+          "resultFormat": "time_series"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 1},
+              {"color": "red", "value": 5}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Flujos vivos (último sondeo)",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT last(\"total_flows\") FROM \"detection\" WHERE $timeFilter",
+          "resultFormat": "time_series"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Racha de ataques (sondeos seguidos)",
+      "description": "Sondeos consecutivos con ataque. A partir de MIT_PERSISTENCE (3 por defecto) se activa la mitigación.",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT last(\"attack_streak\") FROM \"detection\" WHERE $timeFilter",
+          "resultFormat": "time_series"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 1},
+              {"color": "red", "value": 3}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Flujos vs ataques (series)",
+      "description": "Series temporales: cuántos flujos hay y cuántos clasifica el detector como ataque. Los picos coinciden con los ataques.",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT mean(\"total_flows\") AS \"flujos\", mean(\"attacks\") AS \"ataques\" FROM \"detection\" WHERE $timeFilter GROUP BY time($__interval) fill(0)",
+          "resultFormat": "time_series"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Diversidad de fuentes (num_distinct_src_ips + entropía)",
+      "description": "Las dos métricas que más se mueven en un DDoS. En tráfico normal son bajas; en un DDoS distribuido, suben.",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT mean(\"num_distinct_src_ips\") AS \"num_distinct_src_ips\", mean(\"src_ip_entropy\") AS \"src_ip_entropy\" FROM \"detection\" WHERE $timeFilter GROUP BY time($__interval) fill(none)",
+          "resultFormat": "time_series"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "src_ip_entropy"},
+            "properties": [{"id": "custom.axisPlacement", "value": "right"}]
+          }
+        ]
+      }
+    },
+    {
+      "id": 7,
+      "type": "barchart",
+      "title": "Episodios de ataque por hora (DoS / DDoS)",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT count(\"count\") FROM \"attack_event\" WHERE $timeFilter GROUP BY time(1h), \"type\" fill(0)",
+          "resultFormat": "time_series",
+          "alias": "$tag_type"
+        }
+      ],
+      "options": {
+        "orientation": "vertical",
+        "stacking": "none",
+        "showValue": "auto",
+        "groupWidth": 0.7,
+        "barWidth": 0.97,
+        "legend": {"displayMode": "list", "placement": "bottom", "calcs": ["sum"]},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisPlacement": "auto", "axisLabel": "episodios", "fillOpacity": 80, "lineWidth": 0},
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Nuevos flujos / s (rate)",
+      "description": "Tasa de aparición de flujos nuevos. En un ataque suele dispararse (muchas conexiones cortas).",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT mean(\"new_flows_per_sec\") AS \"new_flows_per_sec\", mean(\"dst_port_entropy\") AS \"dst_port_entropy\" FROM \"detection\" WHERE $timeFilter GROUP BY time($__interval) fill(none)",
+          "resultFormat": "time_series"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "dst_port_entropy"},
+            "properties": [{"id": "custom.axisPlacement", "value": "right"}]
+          }
+        ]
+      }
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "DoS · IPs bloqueadas (activas y pasadas)",
+      "description": "activo=1 -> bloqueada ahora. activo=0 -> el bloqueo ya expiró. expira_unix está en segundos epoch.",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 0, "y": 20, "w": 12, "h": 8},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT last(\"active\") AS \"activo\", last(\"expires\") AS \"expira_unix\" FROM \"blocks\" WHERE \"type\" = 'DoS' AND $timeFilter GROUP BY \"target\"",
+          "resultFormat": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true},
+            "indexByName": {"target": 0, "activo": 1, "expira_unix": 2},
+            "renameByName": {"target": "IP origen"}
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {"targetField": "expira_unix", "destinationType": "time", "dateFormat": "X"}
+            ]
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {"fields": {}, "sort": [{"field": "activo", "desc": true}]}
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto", "displayMode": "auto"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "color": {"mode": "thresholds"}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "activo"},
+            "properties": [
+              {"id": "custom.displayMode", "value": "color-background"},
+              {"id": "mappings", "value": [
+                {"type": "value", "options": {"0": {"text": "expirado", "color": "gray"}, "1": {"text": "ACTIVO", "color": "red"}}}
+              ]}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "DDoS · MACs bloqueadas (activas y pasadas)",
+      "description": "activo=1 -> bloqueada ahora. activo=0 -> el bloqueo ya expiró. target es la MAC origen del atacante.",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 12, "y": 20, "w": 12, "h": 8},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT last(\"active\") AS \"activo\", last(\"expires\") AS \"expira_unix\" FROM \"blocks\" WHERE \"type\" = 'DDoS' AND $timeFilter GROUP BY \"target\"",
+          "resultFormat": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true},
+            "indexByName": {"target": 0, "activo": 1, "expira_unix": 2},
+            "renameByName": {"target": "MAC origen"}
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {"targetField": "expira_unix", "destinationType": "time", "dateFormat": "X"}
+            ]
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {"fields": {}, "sort": [{"field": "activo", "desc": true}]}
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto", "displayMode": "auto"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "color": {"mode": "thresholds"}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "activo"},
+            "properties": [
+              {"id": "custom.displayMode", "value": "color-background"},
+              {"id": "mappings", "value": [
+                {"type": "value", "options": {"0": {"text": "expirado", "color": "gray"}, "1": {"text": "ACTIVO", "color": "red"}}}
+              ]}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Reincidentes (nº de bloqueos por origen)",
+      "description": "Cuenta cuántas veces cada IP/MAC ha sido bloqueada. Los reincidentes aparecen arriba.",
+      "datasource": "${DS_INFLUXDB}",
+      "gridPos": {"x": 0, "y": 28, "w": 24, "h": 8},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_INFLUXDB}",
+          "policy": "default",
+          "rawQuery": true,
+          "query": "SELECT count(\"active\") AS \"bloqueos\" FROM \"blocks\" WHERE \"active\" = 1 AND $timeFilter GROUP BY \"target\", \"type\"",
+          "resultFormat": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true},
+            "indexByName": {"type": 0, "target": 1, "bloqueos": 2},
+            "renameByName": {"type": "tipo", "target": "origen (IP / MAC)"}
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {"fields": {}, "sort": [{"field": "bloqueos", "desc": true}]}
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto", "displayMode": "auto"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 2},
+              {"color": "red", "value": 5}
+            ]
+          },
+          "color": {"mode": "thresholds"}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "bloqueos"},
+            "properties": [{"id": "custom.displayMode", "value": "color-background"}]
+          }
+        ]
+      }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 30,
+  "style": "dark",
+  "tags": ["sds", "ddos", "ryu"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "SDS — Detección y mitigación de DDoS",
+  "uid": "sds-ddos",
+  "version": 1,
+  "weekStart": ""
+}

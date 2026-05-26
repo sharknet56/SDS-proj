@@ -383,6 +383,72 @@ Setup detallado en [`setup.md`](setup.md) (misma carpeta `docs/`). Resumen:
    - Terminal 2: `PYTHONPATH=. ryu-manager detect_app.py` (Python sistema)
    - Terminal 3: Mininet con tráfico
 
+## Acciones de mitigación
+
+Cuando el detector reporta ataque, la Ryu app **no** actúa inmediatamente —
+exige `MIT_PERSISTENCE = 3` sondeos seguidos (6 s) con `confidence ≥ 0.80`.
+Esto evita reaccionar a un blip aislado o a un falso positivo del AE que
+XGBoost no haya rescatado.
+
+Una vez confirmado, la acción depende del tipo de ataque:
+
+| Ataque | Acción | Match OpenFlow | Duración |
+|---|---|---|---|
+| **DoS** | Drop por IP origen | `eth_type=IPv4, ipv4_src=<atacante>` | `MIT_TIMEOUT = 30 s` |
+| **DDoS** | Drop por MAC origen (uno por flujo atacante distinto) | `eth_src=<MAC del atacante>` | `MIT_TIMEOUT = 30 s` |
+
+La regla se instala con `hard_timeout=30` y **expira sola** — no hace falta
+lógica de revocación. Si el atacante reincide tras la expiración, vuelve a
+empezar el ciclo (3 sondeos → bloqueo → 30 s → libre).
+
+### ¿Por qué bloquear por MAC en DDoS?
+
+Esta es la "gracia" de tener un controlador SDN. En una red IP convencional
+el router no ve la MAC del cliente (solo la del último salto), así que la
+defensa típica frente a DDoS es **rate-limit a la víctima** (porque la IP
+origen puede estar spoofeada y no fiarse de ella).
+
+Aquí, el controlador Ryu está conectado al switch L2 y ve **todos** los
+campos del frame Ethernet. La MAC origen sí es el atacante físico real —
+incluso si hace `--rand-source` en hping3 para spoofear las IPs, la MAC
+sigue siendo la del host atacante (Mininet/OVS no permiten falsificarla en
+una topología normal).
+
+Consecuencia: en lugar de penalizar el tráfico hacia la víctima (que
+afectaría también a usuarios legítimos), cortamos al **atacante de raíz**.
+Una regla `eth_src=<MAC>` → drop deja inutilizable cualquier flujo de esa
+máquina física durante 30 s, sin importar qué IPs use ni a qué víctimas
+apunte.
+
+Como `detect_app.py` instala los flujos casando por IP (no por MAC), el
+`flow_stat` no trae `eth_src`. Resolvemos IP→MAC con un mapa que se va
+poblando en cada `packet_in` (`self.ip_to_mac[ip.src] = eth.src`), lo cual
+es exacto: la primera vez que el switch ve un paquete de esa IP, también
+ve su MAC.
+
+### ¿Por qué 30 segundos?
+
+Es un compromiso entre **tiempo de demo** y **falsos positivos**:
+
+- Más corto (5-10 s): vuelves a tener el sistema "limpio" rápido para
+  encadenar pruebas, pero un atacante reintenta justo al expirar y el
+  ciclo detección→bloqueo→expiración pasa a ser ruidoso (la regla aparece
+  y desaparece cada 15 s).
+- Más largo (5-15 min): coherente con producción real, pero penaliza
+  durante toda la clase a un host que se confunde con ataque por error.
+- 30 s: el bloqueo es visible en Grafana, la víctima recupera tráfico
+  pronto, y entre ataques sucesivos da tiempo a observar el efecto.
+
+El dashboard que pinta todo esto (series de ataques, tablas de IPs/MACs bloqueadas
+con su `expires`, reincidentes…) se importa de un tirón desde
+[`grafana/sds_dashboard.json`](../grafana/sds_dashboard.json) — ver
+[`grafana.md`](grafana.md).
+
+Para producción real lo subiría a ~5 min con escalado por reincidencia
+(si la misma MAC vuelve a aparecer, el siguiente bloqueo dura el doble,
+con un tope de 30 min). No está implementado: requeriría un contador por
+MAC y decay, sin aportar nada al ejercicio académico.
+
 ## API del Detector (lo que usa la Ryu app)
 
 ```python
@@ -414,12 +480,44 @@ det.default_threshold    # P99 del error AE sobre validación Normal
 
 ## Estado actual de validación
 
-Última ejecución de `test_bench.py`:
+Última ejecución de `test_bench.py` (tres partes):
 
-- **12/13 casos canónicos correctos** (PASS). El único fallo es el caso de "descarga grande a tasa GbE real" — documentado como limitación del entorno de captura, no del modelo.
-- F1 macro = 1.0 sobre el dataset completo.
-- AE separa con margen amplísimo (max error Normal = 5.5, mediana DoS/DDoS = 9000+, threshold P99 = 4.19).
-- Casos adversariales validados correctamente: DoS padded 1500B, DoS multi-target, DDoS spoofeado, DDoS multi-target, pingall benigno.
+### Parte 1 — casos canónicos del detector
+
+**12/13 PASS.** 13 vectores cocinados a mano que cubren los cuadrantes del
+mapa de comportamiento (normal idle/HTTP/descarga/pingall + DoS de cada
+protocolo + DDoS spoofeado/real/multi-target).
+
+- AE separa con margen amplísimo (max error Normal = 5.5, mediana DoS/DDoS ≈ 9000+, threshold P99 = 4.19).
+- Casos adversariales que ahora se atrapan: DoS padded 1500B (evade `avg_packet_size`), DoS multi-target (no se confunde con DDoS), DDoS spoofeado, DDoS multi-target, pingall benigno (no se confunde con multi-target DDoS).
+- El **único FAIL** es "descarga grande a tasa GbE real" — limitación del entorno de captura Mininet, documentada en la sección "Limitaciones conocidas".
+
+### Parte 2 — evaluación sobre el CSV completo
+
+**Accuracy 0.9998** sobre `data/dataset.csv` (sanity check, mismos datos del entreno).
+**F1 macro = 1.0**. Matriz de confusión diagonal salvo 45 normales clasificados como DoS (0.01% de los flujos normales).
+
+### Parte 3 — lógica de mitigación de `detect_app.py`
+
+**9/9 PASS.** Tests con datapath ficticio que verifican el comportamiento de
+la Ryu app sin necesidad de Mininet/Ryu instalado (los módulos `ryu.*` se
+stubbean en `sys.modules` para poder importar `detect_app` desde el venv 3.11):
+
+| # | Test | Comprueba |
+|---|---|---|
+| 1 | `_block_ip` | OFPFlowMod con `ipv4_src=<IP>`, drop, `hard_timeout=MIT_TIMEOUT`, prio 100. |
+| 2 | `_block_mac` | OFPFlowMod con `eth_src=<MAC>`, drop, `hard_timeout=MIT_TIMEOUT`, prio 100. |
+| 3 | confianza | `_mitigate` ignora veredictos con `confidence < 0.80`. |
+| 4 | is_anomaly | `_mitigate` ignora veredictos con `is_anomaly=False`. |
+| 5 | DoS end-to-end | DoS → `_block_ip` + registro `('ip', <IP>)` en `self.mitigated`. |
+| 6 | DDoS end-to-end | DDoS → resuelve IP→MAC con `self.ip_to_mac` → `_block_mac` + registro `('mac', <MAC>)`. |
+| 7 | DDoS sin MAC | Si `ip_to_mac` no tiene esa IP, no actúa y deja `logger.warning`. |
+| 8 | Deduplicación | Dos `_mitigate` seguidos con el mismo target dentro de `MIT_TIMEOUT` instalan UNA sola regla. |
+| 9 | `_prune_blocks` | Limpia entradas vencidas, deja las activas (libera para futuras reactivaciones). |
+
+Cada test del bench lleva un bloque de comentario inline arriba con
+`Escenario`/`Acción`/`Esperado`/`Verifica`, para que se pueda leer qué se
+está probando sin desempaquetar las assertions.
 
 ## Si algo no te cuadra
 

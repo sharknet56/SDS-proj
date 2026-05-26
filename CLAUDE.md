@@ -37,8 +37,10 @@ PPA deadsnakes on Ubuntu 20.04 focal does not provide Python 3.11. Use `uv` only
 # Train models from data/dataset.csv → models/
 python -m src.train
 
-# Run canonical test cases + CSV evaluation
-# Uses data/test.csv if it exists (independent test set), else data/dataset.csv (sanity check on training data).
+# Run all three test suites (canonical detector cases + CSV evaluation + mitigation logic).
+# CSV step uses data/test.csv if present (independent), else data/dataset.csv (sanity check).
+# The mitigation step stubs ryu.* in sys.modules so detect_app can be imported from the 3.11 venv
+# without needing Ryu installed — these tests verify _block_ip / _block_mac / _mitigate / _prune_blocks.
 python test_bench.py
 
 # Serve the detector over TCP (port 9999) — run in venv 3.11
@@ -109,8 +111,6 @@ The AE anomaly threshold is the percentile `AE_THRESHOLD_PERCENTILE` (default 99
 | `label_encoder.pkl` / `label_encoder_binary.pkl` | Corresponding LabelEncoders |
 | `detector_meta.pkl` | Feature names, AE threshold (P99), architecture dims |
 
-`models/iforest.pkl` may also be present from earlier experiments — it is not loaded by `Detector.load` or any current code path. Safe to ignore.
-
 The Autoencoder architecture (`Linear 13→16→8→4→8→16→13`, ReLU, MSE) is defined in [src/detector.py:25-46](src/detector.py#L25-L46) and duplicated in `notebooks/03_anomaly_detector.ipynb`. If you change the architecture, both must stay in sync and models must be retrained.
 
 ### Detection flow
@@ -118,10 +118,10 @@ The Autoencoder architecture (`Linear 13→16→8→4→8→16→13`, ReLU, MSE)
 1. `live_features.window_features` + `per_flow_features` compute features from OFP stats.
 2. `detect_app._ask_detector` sends each flow as a JSON line over TCP to `serve_detector`.
 3. `Detector.predict` runs Autoencoder → if `score > threshold`, runs XGBoost → returns `DetectionResult`.
-4. After `MIT_PERSISTENCE` (default 3) consecutive attack polls with confidence ≥ `MIT_MIN_CONF` (default 0.80), `detect_app._mitigate` installs an OpenFlow rule:
-   - **DoS** → drop by source IP
-   - **DDoS** → rate-limit by destination IP:port via OVS meter (falls back to drop if meters unavailable)
+4. After `MIT_PERSISTENCE` (default 3) consecutive attack polls with confidence ≥ `MIT_MIN_CONF` (default 0.80), `detect_app._mitigate` installs an OpenFlow rule with `hard_timeout=MIT_TIMEOUT` (30 s, auto-expires):
+   - **DoS** → drop by source IP (`OFPMatch(eth_type=IPv4, ipv4_src=<atacante>)`)
+   - **DDoS** → drop by source **MAC** (`OFPMatch(eth_src=<MAC>)`). The flow stats only carry IPs, so `detect_app` resolves IP→MAC via `self.ip_to_mac`, a map populated on every `packet_in` (`self.ip_to_mac[ip.src] = eth.src`). Blocking at L2 catches `--rand-source` attackers that spoof IPs but not the physical MAC. Rationale in [docs/Summary.md § Acciones de mitigación](docs/Summary.md#acciones-de-mitigación).
 
 ### Grafana / InfluxDB
 
-`detect_app.py` writes to InfluxDB (db `SDS`, default port 8086) three measurements: `detection` (per-poll timeseries), `attack_event` (one per attack episode start), `blocks` (mitigation lifecycle). See `grafana.md` for dashboard setup.
+`detect_app.py` writes to InfluxDB (db `SDS`, default port 8086) three measurements: `detection` (per-poll timeseries), `attack_event` (one per attack episode start), `blocks` (mitigation lifecycle — `tags={type, target}`, `fields={active, expires}`; for DDoS `target` is now a MAC address, for DoS an IP). The full dashboard (11 panels) can be imported as-is from [grafana/sds_dashboard.json](grafana/sds_dashboard.json); per-query details in [docs/grafana.md](docs/grafana.md).

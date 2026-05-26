@@ -22,7 +22,7 @@ Cómo se conectan las piezas del sistema en producción y por qué están así.
               │  ─ instala flujos por (IP src, IP dst, proto, port) │
               │  ─ sondea FlowStats cada 2 s                        │
               │  ─ calcula 13 features con src/live_features.py     │
-              │  ─ aplica mitigación (drop o rate-limit con meter)  │
+              │  ─ aplica mitigación (drop por IP o por MAC)        │
               └────┬──────────────────────────────┬─────────────────┘
                    │                              │
    TCP JSON-lines  │                              │  HTTP write
@@ -56,10 +56,17 @@ que está partido así está en [§ Por qué dos venvs](#por-qué-dos-venvs).
 | Feature extraction | Llama a `src.live_features.per_flow_features` (7) y `window_features` (6). |
 | Inferencia | Envía cada flow como JSON line al detector, lee veredicto. |
 | Persistencia anti-falso-positivo | Solo mitiga tras `MIT_PERSISTENCE=3` sondeos consecutivos con ataque y `confidence ≥ MIT_MIN_CONF=0.80`. |
-| Mitigación | **DoS** → drop por IP origen (hard_timeout=30 s). **DDoS** → rate-limit a `DDOS_RATE_KBPS=1000` por OVS meter sobre (IP dst, puerto), con fallback a drop si los meters fallan. |
+| Mitigación | **DoS** → drop por IP origen (`OFPFlowMod` con `ipv4_src=<atacante>`, hard_timeout=30 s). **DDoS** → drop por **MAC** origen (`eth_src=<MAC>`, hard_timeout=30 s). La MAC se resuelve con un mapa IP→MAC poblado en `packet_in_handler`. |
+| IP→MAC | Cada `packet_in` con IP guarda `self.ip_to_mac[ip.src] = eth.src`. Lo usa la lógica de mitigación de DDoS para bloquear en L2. |
 | Telemetría | Escribe 3 measurements en InfluxDB (`detection`, `attack_event`, `blocks`). |
 
 Lo que **no** hace: clasificación. Toda la lógica ML vive en el otro proceso.
+
+> Sobre el "drop por MAC origen" en DDoS: en una red IP convencional el
+> defensor no ve la MAC del cliente y tiene que rate-limit a la víctima.
+> Aquí el controlador SDN sí la ve, así que cortamos al atacante de raíz
+> en L2 (sirve incluso contra `--rand-source`, que spoofea IPs pero no la
+> MAC física). Justificación completa en [`Summary.md` § Acciones de mitigación](Summary.md#acciones-de-mitigación).
 
 ### 2. `serve_detector.py` — servidor del detector (venv 3.11)
 
@@ -110,7 +117,10 @@ anómalo del AE, rescata el falso positivo.
 | `attack_event` | una al iniciar episodio | frecuencia/histórico de ataques |
 | `blocks` | al aplicar (`active=1`) y al expirar (`active=0`) | ciclo de vida de las mitigaciones |
 
-Queries de Grafana y configuración en [`grafana.md`](grafana.md).
+El dashboard de Grafana se importa directamente desde
+[`grafana/sds_dashboard.json`](../grafana/sds_dashboard.json) (11 paneles: stats,
+series con los picos de ataque, tablas de IPs/MACs bloqueadas, reincidentes).
+Paso a paso y queries individuales en [`grafana.md`](grafana.md).
 
 ---
 
@@ -149,6 +159,16 @@ flow en localhost; despreciable frente a los 2 s de polling.
 Si la confianza queda <0.80 o la racha se rompe (un sondeo sin ataque),
 no se mitiga. Por eso un blip aislado no genera bloqueo.
 
+### Variante DDoS
+
+Para un DDoS (varias IPs origen → víctima) los pasos 1-5 son idénticos. En
+el paso 6, en lugar de extraer `ipv4_src`, `detect_app` busca `eth_src`
+para cada flujo atacante en `self.ip_to_mac` (mapa poblado en `packet_in`)
+e instala **una `OFPFlowMod` por MAC** con `eth_src=<MAC>` → drop, también
+con `hard_timeout=30 s`. Si la misma MAC ya está bloqueada, se evita la
+regla duplicada (`_recent`). El resultado: cada atacante físico cae a la
+vez, sin tocar tráfico hacia la víctima.
+
 ---
 
 ## Puertos, paths y configuración
@@ -158,8 +178,6 @@ no se mitiga. Por eso un blip aislado no genera bloqueo.
 | Puerto detector ↔ Ryu | `DETECTOR_ADDR` en `detect_app.py`, hardcoded en `serve_detector.py` | `127.0.0.1:9999` |
 | Intervalo de polling | `POLL` en `detect_app.py` y `capture_app.py` | `2 s` |
 | Persistencia mitigación | `MIT_PERSISTENCE`, `MIT_MIN_CONF`, `MIT_TIMEOUT` en `detect_app.py` | `3, 0.80, 30 s` |
-| Tasa rate-limit DDoS | `DDOS_RATE_KBPS` en `detect_app.py` | `1000 kbps` |
-| Usar meters OVS | `USE_METER` en `detect_app.py` (poner `False` si tu OVS no los soporta) | `True` |
 | InfluxDB | `INFLUX_HOST/PORT/DB` en `detect_app.py` | `127.0.0.1:8086 / SDS` |
 | Umbral AE | `AE_THRESHOLD_PERCENTILE` en `src/train.py` (regenera modelos al cambiarlo) | `99` |
 
@@ -185,7 +203,7 @@ Mandar el dict como JSON-line; sobran claves se ignoran, falta alguna y
 
 | Orden | Proceso | Terminal / venv | Comando |
 |---|---|---|---|
-| 1 | InfluxDB y Grafana (si quieres visualización) | sistema | `sudo systemctl start influxdb grafana-server` |
+| 1 | InfluxDB y Grafana (si quieres visualización; importar `grafana/sds_dashboard.json` la primera vez) | sistema | `sudo systemctl start influxdb grafana-server` |
 | 2 | Detector | venv 3.11 | `source .venv/bin/activate && python serve_detector.py` |
 | 3 | Ryu controller | python sistema | `PYTHONPATH=. ryu-manager detect_app.py` |
 | 4 | Mininet (topología + tráfico) | sistema, root | `sudo mn --controller=remote ...` o `sudo python3 scripts/capture_full.py` para una sesión guiada |

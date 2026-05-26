@@ -30,9 +30,10 @@ revisa que InfluxDB esté arrancado; la detección sigue funcionando igual.
 |-------------|--------|------|--------|
 | `detection` | cada sondeo (2 s) | `type` (predominante) | `total_flows`, `attacks`, `normal`, `dos`, `ddos`, `num_distinct_src_ips`, `src_ip_entropy`, `dst_port_entropy`, `new_flows_per_sec`, `attack_streak` |
 | `attack_event` | al **empezar** cada episodio de ataque | `type` | `count`(=1), `num_src`, `entropy` |
-| `blocks` | al aplicar una mitigación (`active=1`) y al expirar (`active=0`) | `type` (DoS/DDoS), `target` | `active`, `expires`, `port`, `rate_kbps`, `ratelimited` |
+| `blocks` | al aplicar una mitigación (`active=1`) y al expirar (`active=0`) | `type` (DoS/DDoS), `target` | `active`, `expires` |
 
-Para DoS, `target` es la IP origen bloqueada. Para DDoS, `target` es `víctima:puerto`.
+Para DoS, `target` es la IP origen bloqueada (drop por `ipv4_src`).
+Para DDoS, `target` es la MAC origen bloqueada (drop por `eth_src`).
 
 ---
 
@@ -43,12 +44,36 @@ Configuration → Data Sources → Add data source → InfluxDB:
 - **Database:** `SDS`
 - Sin usuario ni contraseña. Guardar (Save & Test).
 
-Crear un dashboard nuevo e ir añadiendo paneles con las queries de abajo
-(pestaña Query → data source InfluxDB → editar en modo texto/raw).
+---
+
+## 4. Importar el dashboard (rápido)
+
+El dashboard completo está en [`grafana/sds_dashboard.json`](../grafana/sds_dashboard.json).
+Se importa entero desde la UI:
+
+1. **Dashboards → New → Import** (o `+` en la barra lateral → Import).
+2. **Upload JSON file** y elige `grafana/sds_dashboard.json`.
+3. En el paso "Options", asigna el data source **InfluxDB** que acabas de crear.
+4. **Import**.
+
+Lo que aparece, en este orden:
+
+| Fila | Paneles |
+|------|---------|
+| 1 (stats) | Ataques DoS · Ataques DDoS · Flujos vivos · Racha de ataques |
+| 2 (series) | Flujos vs ataques · Diversidad de fuentes (`num_distinct_src_ips` + `src_ip_entropy`) |
+| 3 (series + barras) | Episodios por hora (DoS/DDoS) · Nuevos flujos/s + entropía de puerto destino |
+| 4 (tablas) | DoS · IPs bloqueadas (activas y pasadas) · DDoS · MACs bloqueadas (activas y pasadas) |
+| 5 (tabla ancha) | Reincidentes — nº de bloqueos por origen (IP o MAC) |
+
+Refresco: 5 s. Ventana por defecto: últimos 15 min.
 
 ---
 
-## 4. Paneles
+## 5. Paneles (referencia de queries)
+
+Si prefieres montarlos a mano o entender qué hace cada uno, esta es la lista de queries
+en InfluxQL. Son las mismas que usa el JSON de arriba.
 
 ### DoS — IPs bloqueadas (activas y pasadas)
 
@@ -65,18 +90,19 @@ GROUP BY "target"
 Truco: en Transform puedes convertir `expira_unix` (segundos) a hora, y ordenar
 por `activo` para ver primero las activas.
 
-### DDoS — rate-limiting actual y a qué puerto
+### DDoS — MACs bloqueadas (activas y pasadas)
 
-Panel **Table**. `es_ratelimit=1` significa que hay rate-limiting activo (meter);
-`=0` es el fallback de bloqueo. `target` es `víctima:puerto`:
+Panel **Table**. Una fila por MAC; `activo=1` está bloqueada ahora, `activo=0`
+fue un bloqueo que ya expiró. `target` es la MAC origen del atacante:
 
 ```sql
-SELECT last("active") AS "activo", last("port") AS "puerto",
-       last("rate_kbps") AS "kbps", last("ratelimited") AS "es_ratelimit"
+SELECT last("active") AS "activo", last("expires") AS "expira_unix"
 FROM "blocks"
 WHERE "type" = 'DDoS' AND $timeFilter
 GROUP BY "target"
 ```
+
+Mismo Transform que en el panel de DoS para convertir `expira_unix` a hora.
 
 ### DDoS — histórico de entropía
 
@@ -134,7 +160,7 @@ GROUP BY time($__interval) fill(0)
 
 ---
 
-## 5. Notas
+## 6. Notas
 
 - **Conflictos de tipo en InfluxDB:** si cambias el tipo de un campo entre
   ejecuciones (p. ej. un entero pasa a flotante), InfluxDB se queja. Si ocurre,
