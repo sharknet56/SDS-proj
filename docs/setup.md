@@ -254,9 +254,12 @@ por defecto `admin` / `admin`, te pedirá cambiar la contraseña):
      queja pero la conexión vale).
 2. **Dashboards → New → Import → Upload JSON file** → elige
    [`grafana/sds_dashboard.json`](../grafana/sds_dashboard.json) y selecciona
-   el data source que acabas de crear. Trae 11 paneles listos (stats DoS/DDoS,
-   series temporales con los picos de ataque, tablas de IPs/MACs bloqueadas,
-   reincidentes…).
+   el data source que acabas de crear. Trae **11 paneles** listos: 4 stats
+   (ataques DoS, ataques DDoS, flujos vivos, racha), 3 series temporales
+   (flujos vs ataques, diversidad de fuentes, nuevos flujos/s), 1 bar chart
+   de episodios por hora, y 3 tablas (IPs bloqueadas, MACs bloqueadas,
+   reincidentes). No confundir con las 13 *features* del modelo, que son
+   otra cosa.
 
 Detalles de las queries y de cada panel en [`grafana.md`](grafana.md).
 
