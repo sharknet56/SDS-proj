@@ -53,6 +53,11 @@ LABEL_MAP = {"normal": "Normal", "dos": "DoS", "ddos": "DDoS"}
 
 DEDUP = True
 
+# Percentil para el umbral del Autoencoder.
+# Bajar a 95 = más sensible (menos falsos negativos, más falsos positivos).
+# Subir a 99.5 = más conservador.
+AE_THRESHOLD_PERCENTILE = 99
+
 
 def _load_dataset() -> tuple[pd.DataFrame, pd.Series]:
     """Lee el CSV propio: todas las columnas son features salvo 'label'."""
@@ -92,6 +97,33 @@ def _reconstruction_error(ae: Autoencoder, X: np.ndarray) -> np.ndarray:
         return ((ae(xt) - xt) ** 2).mean(dim=1).cpu().numpy()
 
 
+def _ae_diagnostic_report(
+    ae: Autoencoder,
+    X: pd.DataFrame,
+    y: pd.Series,
+    scaler,
+    threshold: float,
+) -> None:
+    """Muestra el error de reconstrucción del AE por clase y la tasa de detección.
+
+    Permite verificar si el umbral realmente separa tráfico normal de ataques.
+    Una buena separación: Normal ≈ 0% detectado, DoS/DDoS ≈ 100% detectado.
+    """
+    X_s = scaler.transform(X)
+    scores = _reconstruction_error(ae, X_s)
+    print(f"\n=== Diagnóstico AE (umbral P{AE_THRESHOLD_PERCENTILE} = {threshold:.5f}) ===")
+    print(f"  {'Clase':<8} {'n':>5}  {'p50':>9}  {'p99':>9}  {'max':>9}  {'detectado':>12}")
+    for label in sorted(y.unique()):
+        mask = (y == label).values
+        s = scores[mask]
+        detected = int((s > threshold).sum())
+        print(
+            f"  {label:<8} {len(s):>5}  {np.percentile(s,50):>9.5f}  "
+            f"{np.percentile(s,99):>9.5f}  {s.max():>9.5f}  "
+            f"{detected:>5}/{len(s)} ({100*detected/len(s):>5.1f}%)"
+        )
+
+
 def _train_and_eval(name: str, X: pd.DataFrame, y_str: pd.Series):
     """Entrena un XGBoost y muestra F1 macro + matriz de confusión."""
     le = LabelEncoder().fit(y_str)
@@ -121,11 +153,12 @@ def _train_and_eval(name: str, X: pd.DataFrame, y_str: pd.Series):
 
     yp = clf.predict(Xte)
     print(f"\n=== {name} ===")
-    print(f"  F1 macro = {f1_score(yte, yp, average='macro'):.4f}")
+    print(f"  F1 macro = {f1_score(yte, yp, average='macro', labels=list(range(len(le.classes_)))):.4f}")
     print(f"  Clases: {list(le.classes_)}")
     print("  Matriz de confusión (filas=real, columnas=predicho):")
-    print(confusion_matrix(yte, yp))
-    print(classification_report(yte, yp, target_names=le.classes_))
+    all_labels = list(range(len(le.classes_)))
+    print(confusion_matrix(yte, yp, labels=all_labels))
+    print(classification_report(yte, yp, labels=all_labels, target_names=le.classes_, zero_division=0))
     return clf, le
 
 
@@ -147,6 +180,15 @@ def main() -> None:
     feature_names = list(X.columns)
     print(f"Features ({len(feature_names)}): {feature_names}")
 
+    # Filas donde el vector de features completo es todo ceros no aportan ninguna
+    # señal — ni de tasa, ni de entropía, ni de tamaño de paquete.
+    all_zero = (X == 0).all(axis=1)
+    if all_zero.sum():
+        print(f"Filtrando {all_zero.sum()} filas con vector de features completamente vacío")
+        X = X[~all_zero].reset_index(drop=True)
+        y_str = y_str[~all_zero].reset_index(drop=True)
+        print(f"Dataset tras filtrado: {X.shape}  clases={dict(y_str.value_counts())}")
+
     # ---------- ETAPA 1: autoencoder (solo Normal) ----------
     is_normal = (y_str == "Normal").values
     X_norm = X[is_normal]
@@ -161,8 +203,9 @@ def main() -> None:
     print("\nEntrenando Autoencoder...")
     ae = _train_autoencoder(X_train_s, epochs=30)
     ae_scores_val = _reconstruction_error(ae, X_val_s)
-    ae_thr_p99 = float(np.percentile(ae_scores_val, 99))
-    print(f"  AE threshold P99 = {ae_thr_p99:.5f}")
+    ae_thr_p99 = float(np.percentile(ae_scores_val, AE_THRESHOLD_PERCENTILE))
+    print(f"  AE threshold P{AE_THRESHOLD_PERCENTILE} = {ae_thr_p99:.5f}")
+    _ae_diagnostic_report(ae, X, y_str, scaler, ae_thr_p99)
 
     # ---------- ETAPA 2a: clasificador MULTICLASE (producción) ----------
     clf_multi, le_multi = _train_and_eval("MULTICLASE  {Normal, DoS, DDoS}", X, y_str)

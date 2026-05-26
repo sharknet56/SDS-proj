@@ -34,6 +34,11 @@ from src import live_features as lf
 POLL = 2  # segundos entre sondeos (tu intervalo de diseño)
 LABEL = os.environ.get("CAPTURE_LABEL", "unknown")
 CSV_PATH = os.environ.get("CAPTURE_CSV", "dataset.csv")
+# Si está activo, NO se escriben filas de flujos sin actividad en la ventana
+# (packets_per_sec == 0 y bytes_per_sec == 0). Esto reduce drásticamente el
+# ruido al capturar SYN floods con puerto origen aleatorio, donde la víctima
+# crea miles de flujos RST con un único paquete que luego quedan inactivos.
+FILTER_IDLE = os.environ.get("CAPTURE_FILTER_IDLE", "0") == "1"
 
 
 class CaptureApp(app_manager.RyuApp):
@@ -133,6 +138,11 @@ class CaptureApp(app_manager.RyuApp):
         for s in stats:
             pf = lf.per_flow_features(s, self.prev, POLL)
             new_prev[lf.flow_key(s)] = (s.packet_count, s.byte_count)
+            # En modo captura limpia, descartamos flujos sin actividad reciente:
+            # son los flujos RST residuales tras un SYN flood, todos casi
+            # idénticos y sin información discriminativa.
+            if FILTER_IDLE and pf["packets_per_sec"] == 0 and pf["bytes_per_sec"] == 0:
+                continue
             row = {**pf, **win}
             rows.append([row[c] for c in lf.COLUMNS] + [LABEL])
 

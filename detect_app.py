@@ -1,22 +1,27 @@
-"""Ryu app de DETECCIÓN + MITIGACIÓN en vivo.
+"""Ryu app de DETECCIÓN + MITIGACIÓN en vivo, con métricas a InfluxDB para Grafana.
 
 Calcula las 11 features (src/live_features.py, matching por IP), consulta al
-detector por socket y, si confirma un ataque de forma sostenida, aplica una
-mitigación según el tipo:
+detector por socket, mitiga según el tipo de ataque y escribe métricas en
+InfluxDB (stack del Lab 4) para visualizarlas en Grafana.
 
     DoS  -> bloquear la IP origen (fuente real y única)
-    DDoS -> rate-limit del tráfico hacia la víctima:puerto (origen no fiable;
-            se protege el servicio atacado sin tocar el resto del host)
+    DDoS -> rate-limit del tráfico hacia la víctima:puerto (origen no fiable)
 
-Salvaguardas contra falsos positivos:
-  - PERSISTENCIA: solo actúa tras varios sondeos seguidos con ataque.
-  - CONFIANZA:    solo actúa si la confianza del modelo es alta.
-  - TIMEOUT:      las reglas de mitigación expiran solas (un error no es eterno).
+Salvaguardas: persistencia (N sondeos seguidos), confianza mínima y timeout.
 
-Lanzamiento (tres terminales, como siempre):
-  1. detector:  python serve_detector.py        (venv 3.11)
-  2. Ryu:       PYTHONPATH=. ryu-manager detect_app.py   (python del sistema)
+Métricas escritas en InfluxDB (db por defecto "SDS"):
+  - detection   : una por sondeo. flujos, ataques, conteo por tipo, entropías,
+                  num_distinct_src_ips... (series temporales).
+  - attack_event: una por EPISODIO de ataque (al empezar). type, num_src, entropy.
+                  Sirve para frecuencia/histórico de ataques.
+  - blocks      : ciclo de vida de cada mitigación. active=1 al aplicar, active=0
+                  al expirar; para DDoS, port/rate_kbps/ratelimited.
+
+Lanzamiento (tres terminales):
+  1. detector:  python serve_detector.py                  (venv 3.11)
+  2. Ryu:       PYTHONPATH=. ryu-manager detect_app.py     (python del sistema)
   3. Mininet:   tráfico / ataques
+(InfluxDB y Grafana arrancados como en el Lab 4.)
 """
 import json
 import socket
@@ -32,17 +37,27 @@ from ryu.ofproto import ofproto_v1_3
 
 from src import live_features as lf
 
+try:
+    from influxdb import InfluxDBClient
+    HAVE_INFLUX = True
+except Exception:
+    HAVE_INFLUX = False
+
 POLL = 2
 DETECTOR_ADDR = ("127.0.0.1", 9999)
 
-# --- parámetros de mitigación ---
+# --- mitigación ---
 MIT_PERSISTENCE = 3      # sondeos seguidos con ataque antes de actuar
 MIT_MIN_CONF = 0.80      # confianza mínima del modelo para actuar
 MIT_TIMEOUT = 30         # segundos que dura la regla (luego expira sola)
 DDOS_RATE_KBPS = 1000    # tasa a la que se limita la víctima:puerto en un DDoS
-# Si los meters de tu OVS fallan (soporte quisquilloso), pon False: en vez de
-# limitar, bloqueará temporalmente la víctima:puerto (más brusco pero fiable).
-USE_METER = True
+USE_METER = True         # si los meters de tu OVS fallan, poner False (bloquea)
+
+# --- InfluxDB (Lab 4) ---
+INFLUX_ENABLED = True
+INFLUX_HOST = "127.0.0.1"
+INFLUX_PORT = 8086
+INFLUX_DB = "SDS"
 
 
 class DetectApp(app_manager.RyuApp):
@@ -55,12 +70,38 @@ class DetectApp(app_manager.RyuApp):
         self.prev = {}
         self.prev_keys = set()
         self.attack_streak = 0      # sondeos consecutivos con ataque
+        self.in_attack = False      # para detectar el inicio de un episodio
         self.mitigated = {}         # objetivo -> instante de expiración
         self.next_meter_id = 1
+        self.influx = self._influx_connect()
         self.monitor_thread = hub.spawn(self._monitor)
-        self.logger.info("[detect] detector en %s:%d | mitigacion: persist=%d conf>=%.2f timeout=%ds",
+        self.logger.info("[detect] detector %s:%d | persist=%d conf>=%.2f timeout=%ds",
                          DETECTOR_ADDR[0], DETECTOR_ADDR[1],
                          MIT_PERSISTENCE, MIT_MIN_CONF, MIT_TIMEOUT)
+
+    # ---------- InfluxDB ----------
+    def _influx_connect(self):
+        if not (INFLUX_ENABLED and HAVE_INFLUX):
+            self.logger.info("[influx] desactivado o libreria ausente; sigo sin metricas")
+            return None
+        try:
+            c = InfluxDBClient(host=INFLUX_HOST, port=INFLUX_PORT, database=INFLUX_DB)
+            c.create_database(INFLUX_DB)
+            self.logger.info("[influx] conectado a %s:%d db=%s", INFLUX_HOST, INFLUX_PORT, INFLUX_DB)
+            return c
+        except Exception as e:
+            self.logger.error("[influx] no disponible (%s); sigo sin metricas", e)
+            return None
+
+    def _influx_write(self, measurement, fields, tags=None):
+        if not self.influx:
+            return
+        try:
+            self.influx.write_points([{"measurement": measurement,
+                                       "tags": tags or {},
+                                       "fields": fields}])
+        except Exception as e:
+            self.logger.error("[influx] write fallo: %s", e)
 
     # ---------- switch L2 + flujos por IP ----------
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -117,7 +158,8 @@ class DetectApp(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def flow_stats_reply_handler(self, ev):
-        # priority == 1: solo los flujos de tráfico (no las reglas de mitigación, prio 100).
+        self._prune_blocks()   # marca como expiradas (active=0) las mitigaciones vencidas
+
         stats = [s for s in ev.msg.body if s.priority == 1]
         if not stats:
             return
@@ -135,12 +177,36 @@ class DetectApp(app_manager.RyuApp):
         verdicts = Counter(v.get("attack_type", "?") for v in results)
         total = sum(verdicts.values())
         attacks = total - verdicts.get("Normal", 0)
+        predominant = max((t for t in verdicts if t not in ("Normal", "?")),
+                          key=lambda t: verdicts[t], default="Normal")
 
         self.logger.info("[detect] %d flujos | %s | num_src=%d entropy=%.2f",
                          total, dict(verdicts),
                          win["num_distinct_src_ips"], win["src_ip_entropy"])
 
-        # Persistencia: cuenta sondeos seguidos con ataque.
+        # Métrica de detección (serie temporal).
+        self._influx_write("detection", tags={"type": predominant}, fields={
+            "total_flows": int(total), "attacks": int(attacks),
+            "normal": int(verdicts.get("Normal", 0)),
+            "dos": int(verdicts.get("DoS", 0)), "ddos": int(verdicts.get("DDoS", 0)),
+            "num_distinct_src_ips": int(win["num_distinct_src_ips"]),
+            "src_ip_entropy": float(win["src_ip_entropy"]),
+            "dst_port_entropy": float(win["dst_port_entropy"]),
+            "new_flows_per_sec": float(win["new_flows_per_sec"]),
+            "attack_streak": int(self.attack_streak),
+        })
+
+        # Episodio de ataque: un evento al empezar (para frecuencia/histórico).
+        if attacks > 0 and not self.in_attack:
+            self.in_attack = True
+            self._influx_write("attack_event", tags={"type": predominant}, fields={
+                "count": 1, "num_src": int(win["num_distinct_src_ips"]),
+                "entropy": float(win["src_ip_entropy"]),
+            })
+        elif attacks == 0:
+            self.in_attack = False
+
+        # Persistencia -> mitigación.
         self.attack_streak = self.attack_streak + 1 if attacks > 0 else 0
         if attacks > 0:
             self.logger.warning("[ALERTA] %d/%d flujos de ataque (racha=%d)",
@@ -180,14 +246,31 @@ class DetectApp(app_manager.RyuApp):
     def _recent(self, key, now):
         return key in self.mitigated and self.mitigated[key] > now
 
+    def _prune_blocks(self):
+        now = time.time()
+        for key, exp in list(self.mitigated.items()):
+            if exp <= now:
+                if key[0] == "ip":
+                    tags = {"type": "DoS", "target": key[1]}
+                    fields = {"active": 0, "expires": float(exp), "port": -1,
+                              "rate_kbps": 0, "ratelimited": 0}
+                else:
+                    tags = {"type": "DDoS", "target": "%s:%s" % (key[1], key[2])}
+                    fields = {"active": 0, "expires": float(exp), "port": int(key[2]),
+                              "rate_kbps": 0, "ratelimited": 0}
+                self._influx_write("blocks", fields=fields, tags=tags)
+                del self.mitigated[key]
+
     def _block_ip(self, dp, ip_src):
         p = dp.ofproto_parser
         match = p.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=ip_src)
-        # instrucciones vacías = drop
         dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
                                  hard_timeout=MIT_TIMEOUT, instructions=[]))
         self.logger.warning("[MITIGACION] DoS -> bloqueo IP origen %s durante %ds",
                             ip_src, MIT_TIMEOUT)
+        self._influx_write("blocks", tags={"type": "DoS", "target": ip_src},
+                           fields={"active": 1, "expires": time.time() + MIT_TIMEOUT,
+                                   "port": -1, "rate_kbps": 0, "ratelimited": 0})
 
     def _rate_limit(self, dp, ip_dst, l4_dst, ip_proto):
         p = dp.ofproto_parser
@@ -199,6 +282,7 @@ class DetectApp(app_manager.RyuApp):
             kwargs["udp_dst"] = l4_dst
         match = p.OFPMatch(**kwargs)
 
+        ratelimited = 0
         if USE_METER:
             try:
                 mid = self.next_meter_id
@@ -211,17 +295,23 @@ class DetectApp(app_manager.RyuApp):
                                                 [p.OFPActionOutput(ofp.OFPP_NORMAL)])]
                 dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
                                          hard_timeout=MIT_TIMEOUT, instructions=inst))
+                ratelimited = 1
                 self.logger.warning("[MITIGACION] DDoS -> rate-limit %s:%s a %d kbps durante %ds",
                                     ip_dst, l4_dst, DDOS_RATE_KBPS, MIT_TIMEOUT)
-                return
             except Exception as e:
                 self.logger.error("[MITIGACION] meter no disponible (%s); bloqueo temporal", e)
 
-        # Fallback: bloquear la víctima:puerto (instrucciones vacías = drop).
-        dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
-                                 hard_timeout=MIT_TIMEOUT, instructions=[]))
-        self.logger.warning("[MITIGACION] DDoS -> bloqueo %s:%s durante %ds (sin meter)",
-                            ip_dst, l4_dst, MIT_TIMEOUT)
+        if not ratelimited:
+            dp.send_msg(p.OFPFlowMod(datapath=dp, priority=100, match=match,
+                                     hard_timeout=MIT_TIMEOUT, instructions=[]))
+            self.logger.warning("[MITIGACION] DDoS -> bloqueo %s:%s durante %ds (sin meter)",
+                                ip_dst, l4_dst, MIT_TIMEOUT)
+
+        self._influx_write("blocks", tags={"type": "DDoS", "target": "%s:%s" % (ip_dst, l4_dst)},
+                           fields={"active": 1, "expires": time.time() + MIT_TIMEOUT,
+                                   "port": int(l4_dst),
+                                   "rate_kbps": int(DDOS_RATE_KBPS if ratelimited else 0),
+                                   "ratelimited": int(ratelimited)})
 
     def _ask_detector(self, feats_list):
         results = []

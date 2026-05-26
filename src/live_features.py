@@ -19,7 +19,8 @@ PER_FLOW = [
     "packets_per_sec", "bytes_per_sec", "avg_packet_size", "flow_duration_sec",
 ]
 WINDOW = [
-    "src_ip_entropy", "dst_port_entropy", "new_flows_per_sec", "num_distinct_src_ips",
+    "src_ip_entropy", "dst_port_entropy", "dst_ip_entropy",
+    "new_flows_per_sec", "num_distinct_src_ips", "num_distinct_dst_ips",
 ]
 COLUMNS = PER_FLOW + WINDOW          # orden de columnas del CSV (sin la etiqueta)
 
@@ -88,18 +89,30 @@ def per_flow_features(stat, prev: dict, poll_interval: float) -> dict:
 def window_features(stats, prev_keys: set, poll_interval: float) -> tuple[dict, set]:
     """Features agregadas de TODA la ventana (un único valor por sondeo).
 
+    Mira tanto la diversidad de IPs origen como de IPs destino. Esa pareja
+    distingue patrones que serían ambiguos viendo solo el origen:
+
+        src div LOW  + dst div LOW   →  conexión punto-a-punto (normal)
+        src div LOW  + dst div HIGH  →  un host a muchos (escaneo / monitorización)
+        src div HIGH + dst div LOW   →  muchos a uno (DDoS o servidor agregador)
+        src div HIGH + dst div HIGH  →  malla (pingall, P2P, CI distribuido)
+
     Devuelve (dict_de_features, claves_de_este_sondeo) para que el llamante
     guarde las claves y en el siguiente sondeo sepa cuáles son nuevas.
     """
     src_ips = [mget(s.match, "ipv4_src", None) for s in stats]
     src_ips = [ip for ip in src_ips if ip]
+    dst_ips = [mget(s.match, "ipv4_dst", None) for s in stats]
+    dst_ips = [ip for ip in dst_ips if ip]
     dst_ports = [_dst_port(s.match) for s in stats]
     keys_now = {flow_key(s) for s in stats}
     new_flows = len(keys_now - prev_keys)
     feats = {
-        "src_ip_entropy":    shannon_entropy(src_ips),
-        "dst_port_entropy":  shannon_entropy(dst_ports),
-        "new_flows_per_sec": new_flows / poll_interval,
-        "num_distinct_src_ips":    len(set(src_ips)),
+        "src_ip_entropy":       shannon_entropy(src_ips),
+        "dst_port_entropy":     shannon_entropy(dst_ports),
+        "dst_ip_entropy":       shannon_entropy(dst_ips),
+        "new_flows_per_sec":    new_flows / poll_interval,
+        "num_distinct_src_ips": len(set(src_ips)),
+        "num_distinct_dst_ips": len(set(dst_ips)),
     }
     return feats, keys_now

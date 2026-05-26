@@ -7,7 +7,14 @@ Proyecto de la asignatura **Software Defined Security**. Detección de ataques D
 - **Subgrupo A (este repo)** — Modelo de detección.
 - **Subgrupo B** — Topología SDN (Mininet) y bloqueo (instalación de reglas OpenFlow).
 
-El contrato entre ambos subgrupos está documentado en [`docs/INTERFACE.md`](docs/INTERFACE.md).
+Documentación del sistema desplegado:
+- [`docs/INTERFACE.md`](docs/INTERFACE.md) — arquitectura desplegada, cómo se comunican Ryu ↔ detector ↔ InfluxDB.
+- [`docs/Summary.md`](docs/Summary.md) — qué hace el modelo, las 13 features, qué detecta y qué no.
+- [`docs/setup.md`](docs/setup.md) — instalación paso a paso.
+- [`docs/grafana.md`](docs/grafana.md) — paneles de Grafana sobre las métricas que escribe `detect_app.py`.
+- [`CLAUDE.md`](CLAUDE.md) — guía de orientación para futuras sesiones de Claude Code.
+
+> El resto de este README es la propuesta original del proyecto. Para lo que está realmente desplegado, ver los docs de arriba.
 
 ## Enfoque
 
