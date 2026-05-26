@@ -50,6 +50,10 @@ MIT_DOS_MIN_PPS = 50          # un DoS real va a >>50 pps; un ping va a 1-2 pps
 MIT_DDOS_MIN_NEW_FLOWS = 5    # nuevos flujos/seg típicos de DDoS spoofed
 MIT_DDOS_MIN_DISTINCT_SRCS = 10  # IPs origen distintas en la ventana
 MIT_TIMEOUT = 60         # segundos que dura la regla (luego expira sola)
+# IPs intocables: el servidor (10.0.0.4) genera tráfico de respuesta a alto
+# volumen que el modelo a veces marca como DoS. Nunca debe bloquearse a sí
+# misma ni la MAC asociada, sea cual sea el veredicto del detector.
+IMMUNE_IPS = {"10.0.0.4"}
 
 
 class DetectApp(app_manager.RyuApp):
@@ -215,6 +219,10 @@ class DetectApp(app_manager.RyuApp):
                 ip_src = lf.mget(m, "ipv4_src", None)
                 if not ip_src:
                     continue
+                if ip_src in IMMUNE_IPS:
+                #     self.logger.warning("[MITIGACION] inmune (DoS): ipv4_src=%s en lista blanca",
+                #                         ip_src)
+                    continue
                 key = ("ip", ip_src)
                 if self._recent(key, now):
                     continue
@@ -229,6 +237,14 @@ class DetectApp(app_manager.RyuApp):
                     # Sin mapeo aprendido no podemos bloquear por MAC; lo
                     # registramos para diagnosticar y saltamos este flujo.
                     self.logger.warning("[MITIGACION] DDoS: sin MAC para ip_src=%s", ip_src)
+                    continue
+                # Inmunidad por MAC: si esta MAC corresponde a alguna IP de la
+                # lista blanca (puede haber spoofing, así que comprobamos todas
+                # las IPs aprendidas para esa MAC), no se bloquea.
+                immune_macs = {self.ip_to_mac.get(ip) for ip in IMMUNE_IPS}
+                if mac_src in immune_macs:
+                #     self.logger.warning("[MITIGACION] inmune (DDoS): MAC %s pertenece a IP "
+                #                         "protegida en lista blanca", mac_src)
                     continue
                 key = ("mac", mac_src)
                 if self._recent(key, now):
